@@ -2,6 +2,8 @@
 
 pixdr is a pure-Rust Android NativeActivity SDR app for using an Ettus/NI USRP B210 from an Android phone over USB host mode.
 
+![pixdr running on Android with a live B210 spectrum and waterfall](docs/pixdr-android-spectrum.png)
+
 Current target setup:
 
 - Android NativeActivity, no Java/Kotlin app code
