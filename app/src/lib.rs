@@ -21,6 +21,7 @@ const WATERFALL_ROWS: usize = 96;
 const SAFE_TOP_PAD: i8 = 72;
 const SAFE_SIDE_PAD: i8 = 18;
 const SAFE_BOTTOM_PAD: i8 = 18;
+const SPECTRUM_GESTURE_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Global storage for the B210 USB file descriptor obtained in android_on_create.
 static B210_FD: OnceLock<Mutex<Option<i32>>> = OnceLock::new();
@@ -166,8 +167,8 @@ fn start_sdr_worker(app: winit::platform::android::activity::AndroidApp, shared:
                         s.status = "B210 opened; RX stream failed".to_string();
                         s.detail = format!("No live samples: {e}");
                         s.streaming = false;
-                        s.spectrum_db.fill(-120.0);
-                        s.waterfall.clear();
+                        // Keep the last spectrum/waterfall frame visible. Retunes and transient
+                        // stream setup failures should look frozen, not like a hard reset.
                     });
                     // Keep the USRP handle alive even if streaming setup failed.
                     loop {
@@ -278,31 +279,34 @@ fn configure_and_stream(usrp: &mut uhd::Usrp, shared: &SharedState) -> anyhow::R
 }
 
 fn apply_rx_config(usrp: &mut uhd::Usrp, shared: &SharedState) -> anyhow::Result<()> {
-    let (center_hz, bandwidth_hz, gain_db, revision) = {
+    let (center_hz, mut bandwidth_hz, sample_rate, gain_db, revision) = {
         let state = shared.lock().unwrap();
         (
             state.center_hz,
             state.bandwidth_hz,
+            state.sample_rate,
             state.gain_db,
             state.config_revision,
         )
     };
-    let sample_rate = bandwidth_hz;
+    bandwidth_hz = bandwidth_hz.min(sample_rate);
 
     update_state(shared, |s| {
         s.status = "Configuring RX".to_string();
         s.detail = format!(
-            "center={:.6} MHz, bandwidth={:.3} MHz, gain={:.1} dB",
+            "center={:.6} MHz, bandwidth={:.3} MHz, rate={:.3} MS/s, gain={:.1} dB",
             center_hz / 1e6,
             bandwidth_hz / 1e6,
+            sample_rate / 1e6,
             gain_db
         );
     });
 
     info!(
-        "Applying RX config rev={revision}: center={:.6} MHz bandwidth={:.3} MHz gain={:.1} dB",
+        "Applying RX config rev={revision}: center={:.6} MHz bandwidth={:.3} MHz sample_rate={:.3} MS/s gain={:.1} dB",
         center_hz / 1e6,
         bandwidth_hz / 1e6,
+        sample_rate / 1e6,
         gain_db
     );
 
@@ -324,9 +328,10 @@ fn apply_rx_config(usrp: &mut uhd::Usrp, shared: &SharedState) -> anyhow::Result
         s.applied_revision = revision;
         s.status = if s.streaming { "Streaming" } else { "B210 opened" }.to_string();
         s.detail = format!(
-            "RX tuned: {:.6} MHz / {:.3} MHz BW",
+            "RX tuned: {:.6} MHz / {:.3} MHz BW / {:.3} MS/s",
             center_hz / 1e6,
-            bandwidth_hz / 1e6
+            bandwidth_hz / 1e6,
+            sample_rate / 1e6
         );
     });
 
@@ -427,6 +432,10 @@ enum UiTab {
 struct PixdrApp {
     shared: SharedState,
     active_tab: UiTab,
+    freq_edit_digit: Option<usize>,
+    freq_edit_text: String,
+    spectrum_pinch_active: bool,
+    spectrum_last_commit: Option<Instant>,
 }
 
 impl PixdrApp {
@@ -434,6 +443,10 @@ impl PixdrApp {
         Self {
             shared,
             active_tab: UiTab::Radio,
+            freq_edit_digit: None,
+            freq_edit_text: String::new(),
+            spectrum_pinch_active: false,
+            spectrum_last_commit: None,
         }
     }
 
@@ -466,11 +479,23 @@ impl eframe::App for PixdrApp {
                 draw_tabs(ui, &mut self.active_tab);
                 ui.add_space(4.0);
                 match self.active_tab {
-                    UiTab::Radio => draw_controls(ui, &self.shared, &state),
+                    UiTab::Radio => draw_controls(
+                        ui,
+                        &self.shared,
+                        &state,
+                        &mut self.freq_edit_digit,
+                        &mut self.freq_edit_text,
+                    ),
                     UiTab::Fft => draw_fft_controls(ui, &self.shared, &state),
                 }
                 ui.add_space(6.0);
-                draw_spectrum(ui, &state);
+                draw_spectrum(
+                    ui,
+                    &self.shared,
+                    &state,
+                    &mut self.spectrum_pinch_active,
+                    &mut self.spectrum_last_commit,
+                );
                 ui.add_space(6.0);
                 draw_waterfall(ui, &state);
                 ui.add_space(4.0);
@@ -505,91 +530,399 @@ fn draw_tabs(ui: &mut egui::Ui, active: &mut UiTab) {
     });
 }
 
-fn draw_controls(ui: &mut egui::Ui, shared: &SharedState, state: &SdrUiState) {
+fn draw_controls(
+    ui: &mut egui::Ui,
+    shared: &SharedState,
+    state: &SdrUiState,
+    freq_edit_digit: &mut Option<usize>,
+    freq_edit_text: &mut String,
+) {
     egui::Frame::group(ui.style())
-        .fill(egui::Color32::from_rgb(20, 22, 26))
+        .fill(egui::Color32::from_rgb(18, 21, 27))
+        .inner_margin(egui::Margin {
+            left: 12,
+            right: 12,
+            top: 10,
+            bottom: 12,
+        })
         .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(format!("Device: {}", state.device));
-                ui.separator();
-                ui.label(if state.streaming { "RX: live UHD" } else { "RX: preview" });
-                ui.separator();
-                ui.label(format!("rev {}/{}", state.applied_revision, state.config_revision));
-            });
-            ui.separator();
-            draw_tuning_controls(ui, shared, state);
+            draw_tuning_controls(ui, shared, state, freq_edit_digit, freq_edit_text);
         });
 }
 
-fn draw_tuning_controls(ui: &mut egui::Ui, shared: &SharedState, state: &SdrUiState) {
+fn draw_tuning_controls(
+    ui: &mut egui::Ui,
+    shared: &SharedState,
+    state: &SdrUiState,
+    freq_edit_digit: &mut Option<usize>,
+    freq_edit_text: &mut String,
+) {
     let mut center_mhz = state.center_hz / 1e6;
     let mut bandwidth_mhz = state.bandwidth_hz / 1e6;
+    let mut sample_rate_mhz = state.sample_rate / 1e6;
     let mut gain_db = state.gain_db;
     let mut changed = false;
 
-    ui.label(format!("Center frequency: {:.6} MHz", center_mhz));
-    ui.horizontal(|ui| {
-        changed |= ui.add_sized([62.0, 30.0], egui::Button::new("−10M")).clicked().then(|| center_mhz -= 10.0).is_some();
-        changed |= ui.add_sized([62.0, 30.0], egui::Button::new("−1M")).clicked().then(|| center_mhz -= 1.0).is_some();
-        changed |= ui.add_sized([72.0, 30.0], egui::Button::new("−100k")).clicked().then(|| center_mhz -= 0.1).is_some();
-    });
-    let resp = ui.add_sized(
-        [ui.available_width(), 30.0],
-        egui::Slider::new(&mut center_mhz, 50.0..=6000.0)
-            .text("MHz")
-            .step_by(0.001),
-    );
-    changed |= resp.changed();
-    ui.horizontal(|ui| {
-        changed |= ui.add_sized([72.0, 30.0], egui::Button::new("+100k")).clicked().then(|| center_mhz += 0.1).is_some();
-        changed |= ui.add_sized([62.0, 30.0], egui::Button::new("+1M")).clicked().then(|| center_mhz += 1.0).is_some();
-        changed |= ui.add_sized([62.0, 30.0], egui::Button::new("+10M")).clicked().then(|| center_mhz += 10.0).is_some();
-    });
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(9, 12, 17))
+        .inner_margin(egui::Margin {
+            left: 12,
+            right: 12,
+            top: 10,
+            bottom: 12,
+        })
+        .show(ui, |ui| {
+            section_label(ui, "CENTER FREQUENCY");
+            ui.add_space(6.0);
+            changed |= draw_frequency_digits(ui, &mut center_mhz, freq_edit_digit, freq_edit_text);
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Slide a digit vertically to change only that digit. Tap a digit to edit it in place.")
+                    .size(11.0)
+                    .color(egui::Color32::from_rgb(115, 125, 140)),
+            );
+        });
 
-    ui.add_space(3.0);
-    ui.label(format!("Bandwidth / sample rate: {:.3} MHz", bandwidth_mhz));
-    ui.horizontal_wrapped(|ui| {
-        for bw in [0.2, 0.5, 1.0, 2.0, 5.0, 10.0] {
-            if ui.add_sized([58.0, 28.0], egui::Button::new(format!("{bw:.1}M"))).clicked() {
-                bandwidth_mhz = bw;
-                changed = true;
-            }
-        }
-    });
-    let resp = ui.add_sized(
-        [ui.available_width(), 30.0],
-        egui::Slider::new(&mut bandwidth_mhz, 0.2..=20.0)
-            .text("MHz")
-            .step_by(0.1),
+    ui.add_space(10.0);
+    changed |= draw_numeric_input_row(
+        ui,
+        "Bandwidth",
+        &mut bandwidth_mhz,
+        0.2..=56.0,
+        0.1,
+        3,
+        " MHz",
     );
-    changed |= resp.changed();
-
-    ui.add_space(3.0);
-    ui.label(format!("Gain: {:.1} dB", gain_db));
-    let resp = ui.add_sized(
-        [ui.available_width(), 30.0],
-        egui::Slider::new(&mut gain_db, 0.0..=76.0)
-            .text("dB")
-            .step_by(1.0),
+    changed |= draw_numeric_input_row(
+        ui,
+        "Sample rate",
+        &mut sample_rate_mhz,
+        0.2..=61.44,
+        0.1,
+        3,
+        " MS/s",
     );
-    changed |= resp.changed();
+    changed |= draw_numeric_input_row(ui, "RF gain", &mut gain_db, 0.0..=76.0, 1.0, 1, " dB");
 
     if changed {
         center_mhz = center_mhz.clamp(50.0, 6000.0);
-        bandwidth_mhz = bandwidth_mhz.clamp(0.2, 20.0);
+        sample_rate_mhz = sample_rate_mhz.clamp(0.2, 61.44);
+        bandwidth_mhz = bandwidth_mhz.clamp(0.2, sample_rate_mhz.min(56.0));
         gain_db = gain_db.clamp(0.0, 76.0);
         update_state(shared, |s| {
             s.center_hz = center_mhz * 1e6;
             s.bandwidth_hz = bandwidth_mhz * 1e6;
-            s.sample_rate = s.bandwidth_hz;
+            s.sample_rate = sample_rate_mhz * 1e6;
             s.gain_db = gain_db;
             s.config_revision = s.config_revision.wrapping_add(1);
             s.detail = format!(
-                "Pending tune: {:.6} MHz / {:.3} MHz BW / {:.1} dB",
-                center_mhz, bandwidth_mhz, gain_db
+                "Pending tune: {:.6} MHz / {:.3} MHz BW / {:.3} MS/s / {:.1} dB",
+                center_mhz, bandwidth_mhz, sample_rate_mhz, gain_db
             );
         });
     }
+}
+
+fn section_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .size(12.0)
+            .color(egui::Color32::from_rgb(135, 145, 160)),
+    );
+}
+
+fn draw_frequency_digits(
+    ui: &mut egui::Ui,
+    center_mhz: &mut f64,
+    freq_edit_digit: &mut Option<usize>,
+    freq_edit_text: &mut String,
+) -> bool {
+    let hz = (*center_mhz * 1e6).round().clamp(50.0e6, 6000.0e6) as i64;
+    let int_mhz = hz / 1_000_000;
+    let frac_hz = hz.rem_euclid(1_000_000);
+    let int_part = format!("{int_mhz:04}");
+    let frac_part = format!("{frac_hz:06}");
+    let mut changed = false;
+
+    let available = ui.available_width();
+    let cell_w = ((available - 88.0) / 10.0).clamp(18.0, 25.0);
+    let digit_font = (cell_w + 3.0).clamp(23.0, 30.0);
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for (idx, digit) in int_part.chars().enumerate() {
+            changed |= frequency_digit_cell(
+                ui,
+                digit,
+                idx,
+                center_mhz,
+                cell_w,
+                digit_font,
+                freq_edit_digit,
+                freq_edit_text,
+            );
+        }
+        ui.label(
+            egui::RichText::new(".")
+                .monospace()
+                .size(digit_font)
+                .color(egui::Color32::from_rgb(170, 178, 190)),
+        );
+        for (idx, digit) in frac_part.chars().enumerate() {
+            if idx == 3 {
+                ui.add_space(3.0);
+            }
+            changed |= frequency_digit_cell(
+                ui,
+                digit,
+                idx + 4,
+                center_mhz,
+                cell_w,
+                digit_font,
+                freq_edit_digit,
+                freq_edit_text,
+            );
+        }
+        ui.add_space(3.0);
+        ui.label(
+            egui::RichText::new("MHz")
+                .size(15.0)
+                .color(egui::Color32::from_rgb(150, 158, 170)),
+        );
+    });
+
+    changed
+}
+
+fn frequency_digit_cell(
+    ui: &mut egui::Ui,
+    digit: char,
+    digit_index: usize,
+    center_mhz: &mut f64,
+    cell_w: f32,
+    digit_font: f32,
+    freq_edit_digit: &mut Option<usize>,
+    freq_edit_text: &mut String,
+) -> bool {
+    if *freq_edit_digit == Some(digit_index) {
+        return frequency_digit_editor_cell(
+            ui,
+            digit,
+            digit_index,
+            center_mhz,
+            cell_w,
+            digit_font,
+            freq_edit_digit,
+            freq_edit_text,
+        );
+    }
+
+    let size = egui::vec2(cell_w, 52.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    let hovered = response.hovered();
+    let active = response.dragged();
+    let fill = if active {
+        egui::Color32::from_rgb(38, 72, 96)
+    } else if hovered {
+        egui::Color32::from_rgb(31, 39, 50)
+    } else {
+        egui::Color32::from_rgb(22, 27, 36)
+    };
+    let stroke = if active || hovered {
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(92, 185, 230))
+    } else {
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 52, 64))
+    };
+    ui.painter().rect(rect, 4.0, fill, stroke, egui::StrokeKind::Inside);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        digit,
+        egui::FontId::monospace(digit_font),
+        egui::Color32::from_rgb(235, 240, 248),
+    );
+
+    if response.clicked() {
+        *freq_edit_digit = Some(digit_index);
+        *freq_edit_text = digit.to_string();
+        return false;
+    }
+
+    let mut step_delta = 0;
+    let drag_id = response.id.with("digit_drag_residual");
+    if response.dragged() {
+        let mut residual = ui.data(|data| data.get_temp::<f32>(drag_id).unwrap_or(0.0));
+        residual += -response.drag_delta().y;
+        let drag_steps = (residual / 7.0).trunc() as i32;
+        if drag_steps != 0 {
+            step_delta += drag_steps;
+            residual -= drag_steps as f32 * 7.0;
+        }
+        ui.data_mut(|data| data.insert_temp(drag_id, residual));
+    } else {
+        ui.data_mut(|data| data.insert_temp(drag_id, 0.0));
+    }
+
+    step_delta != 0 && tune_frequency_digit_without_carry(center_mhz, digit_index, step_delta)
+}
+
+fn frequency_digit_editor_cell(
+    ui: &mut egui::Ui,
+    digit: char,
+    digit_index: usize,
+    center_mhz: &mut f64,
+    cell_w: f32,
+    digit_font: f32,
+    freq_edit_digit: &mut Option<usize>,
+    freq_edit_text: &mut String,
+) -> bool {
+    let id = ui.make_persistent_id(("freq_digit_editor", digit_index));
+    if freq_edit_text.is_empty() {
+        *freq_edit_text = digit.to_string();
+    }
+
+    let response = ui
+        .scope(|ui| {
+            ui.style_mut().visuals.text_cursor.stroke = egui::Stroke::NONE;
+            ui.add_sized(
+                [cell_w, 52.0],
+                egui::TextEdit::singleline(freq_edit_text)
+                    .id(id)
+                    .font(egui::FontId::monospace(digit_font))
+                    .horizontal_align(egui::Align::Center)
+                    .desired_width(cell_w)
+                    .margin(egui::vec2(0.0, 9.0)),
+            )
+        })
+        .inner;
+    response.request_focus();
+
+    let mut changed = false;
+    if response.changed() {
+        let typed_digit = freq_edit_text.chars().rev().find(|c| c.is_ascii_digit());
+        if let Some(typed_digit) = typed_digit {
+            *freq_edit_text = typed_digit.to_string();
+            changed = set_frequency_digit_without_carry(center_mhz, digit_index, typed_digit);
+            if digit_index < 9 {
+                *freq_edit_digit = Some(digit_index + 1);
+                *freq_edit_text = current_frequency_digit(*center_mhz, digit_index + 1).to_string();
+            } else {
+                *freq_edit_digit = None;
+                freq_edit_text.clear();
+            }
+        } else {
+            freq_edit_text.clear();
+        }
+    }
+
+    let clicked_outside = ui.input(|input| {
+        input.pointer.any_click()
+            && input
+                .pointer
+                .interact_pos()
+                .map(|pos| !response.rect.contains(pos))
+                .unwrap_or(false)
+    });
+    if ui.input(|input| input.key_pressed(egui::Key::Enter)) || response.lost_focus() || clicked_outside {
+        *freq_edit_digit = None;
+        freq_edit_text.clear();
+    }
+
+    changed
+}
+
+fn current_frequency_digit(center_mhz: f64, digit_index: usize) -> char {
+    let hz = (center_mhz * 1e6).round().clamp(50.0e6, 6000.0e6) as i64;
+    let int_mhz = hz / 1_000_000;
+    let frac_hz = hz.rem_euclid(1_000_000);
+    format!("{int_mhz:04}{frac_hz:06}")
+        .chars()
+        .nth(digit_index)
+        .unwrap_or('0')
+}
+
+fn tune_frequency_digit_without_carry(center_mhz: &mut f64, digit_index: usize, step_delta: i32) -> bool {
+    let Some(old_digit) = current_frequency_digit(*center_mhz, digit_index).to_digit(10) else {
+        return false;
+    };
+    let new_digit = (old_digit as i32 + step_delta).rem_euclid(10) as u32;
+    let Some(new_digit) = char::from_digit(new_digit, 10) else {
+        return false;
+    };
+    set_frequency_digit_without_carry(center_mhz, digit_index, new_digit)
+}
+
+fn set_frequency_digit_without_carry(center_mhz: &mut f64, digit_index: usize, new_digit: char) -> bool {
+    if digit_index >= 10 || !new_digit.is_ascii_digit() {
+        return false;
+    }
+    let hz = (*center_mhz * 1e6).round().clamp(50.0e6, 6000.0e6) as i64;
+    let int_mhz = hz / 1_000_000;
+    let frac_hz = hz.rem_euclid(1_000_000);
+    let mut digits: Vec<char> = format!("{int_mhz:04}{frac_hz:06}").chars().collect();
+    if digits[digit_index] == new_digit {
+        return false;
+    }
+    digits[digit_index] = new_digit;
+    let int_part: String = digits[..4].iter().collect();
+    let frac_part: String = digits[4..].iter().collect();
+    let Ok(int_mhz) = int_part.parse::<i64>() else {
+        return false;
+    };
+    let Ok(frac_hz) = frac_part.parse::<i64>() else {
+        return false;
+    };
+    let tuned_hz = int_mhz * 1_000_000 + frac_hz;
+    if !(50_000_000..=6_000_000_000).contains(&tuned_hz) {
+        return false;
+    }
+    *center_mhz = tuned_hz as f64 / 1e6;
+    true
+}
+
+fn draw_numeric_input_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f64,
+    range: std::ops::RangeInclusive<f64>,
+    speed: f64,
+    decimals: usize,
+    suffix: &str,
+) -> bool {
+    let mut changed = false;
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(9, 12, 17))
+        .inner_margin(egui::Margin {
+            left: 10,
+            right: 10,
+            top: 5,
+            bottom: 5,
+        })
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.set_min_height(32.0);
+                ui.add_sized(
+                    [112.0, 24.0],
+                    egui::Label::new(
+                        egui::RichText::new(label)
+                            .size(13.0)
+                            .color(egui::Color32::from_rgb(135, 145, 160)),
+                    ),
+                );
+                changed |= ui
+                    .add_sized(
+                        [ui.available_width(), 30.0],
+                        egui::DragValue::new(value)
+                            .range(range)
+                            .speed(speed)
+                            .fixed_decimals(decimals)
+                            .suffix(suffix),
+                    )
+                    .changed();
+            });
+        });
+    ui.add_space(4.0);
+    changed
 }
 
 fn draw_fft_controls(ui: &mut egui::Ui, shared: &SharedState, state: &SdrUiState) {
@@ -665,15 +998,30 @@ fn draw_fft_controls(ui: &mut egui::Ui, shared: &SharedState, state: &SdrUiState
         });
 }
 
-fn draw_spectrum(ui: &mut egui::Ui, state: &SdrUiState) {
+fn draw_spectrum(
+    ui: &mut egui::Ui,
+    shared: &SharedState,
+    state: &SdrUiState,
+    spectrum_pinch_active: &mut bool,
+    spectrum_last_commit: &mut Option<Instant>,
+) {
     let desired = egui::vec2(ui.available_width(), (ui.available_height() * 0.48).clamp(260.0, 520.0));
-    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click_and_drag());
+    handle_spectrum_gestures(
+        ui,
+        shared,
+        state,
+        rect,
+        &response,
+        spectrum_pinch_active,
+        spectrum_last_commit,
+    );
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(5, 7, 10));
 
     draw_grid(&painter, rect);
 
-    if state.streaming && state.frames > 0 {
+    if state.frames > 0 {
         let min_db = -120.0;
         let max_db = 0.0;
         let points: Vec<egui::Pos2> = state
@@ -702,37 +1050,110 @@ fn draw_spectrum(ui: &mut egui::Ui, state: &SdrUiState) {
         );
     }
     painter.text(
-        rect.left_top() + egui::vec2(8.0, 8.0),
-        egui::Align2::LEFT_TOP,
-        "Spectrum (dBFS)",
-        egui::FontId::proportional(15.0),
-        egui::Color32::LIGHT_GRAY,
-    );
-    painter.text(
-        rect.right_top() + egui::vec2(-8.0, 8.0),
-        egui::Align2::RIGHT_TOP,
-        format!(
-            "{:.6} MHz  span {:.3} MHz",
-            state.center_hz / 1e6,
-            state.bandwidth_hz / 1e6
-        ),
-        egui::FontId::proportional(15.0),
-        egui::Color32::LIGHT_GRAY,
-    );
-    painter.text(
         rect.left_bottom() + egui::vec2(8.0, -8.0),
         egui::Align2::LEFT_BOTTOM,
-        format!("{:.6} MHz", (state.center_hz - state.bandwidth_hz / 2.0) / 1e6),
+        format!("{:.6} MHz", (state.center_hz - state.sample_rate / 2.0) / 1e6),
         egui::FontId::proportional(13.0),
         egui::Color32::GRAY,
     );
     painter.text(
         rect.right_bottom() + egui::vec2(-8.0, -8.0),
         egui::Align2::RIGHT_BOTTOM,
-        format!("{:.6} MHz", (state.center_hz + state.bandwidth_hz / 2.0) / 1e6),
+        format!("{:.6} MHz", (state.center_hz + state.sample_rate / 2.0) / 1e6),
         egui::FontId::proportional(13.0),
         egui::Color32::GRAY,
     );
+}
+
+fn handle_spectrum_gestures(
+    ui: &mut egui::Ui,
+    shared: &SharedState,
+    state: &SdrUiState,
+    rect: egui::Rect,
+    response: &egui::Response,
+    spectrum_pinch_active: &mut bool,
+    spectrum_last_commit: &mut Option<Instant>,
+) {
+    let span_hz = state.sample_rate.max(1.0);
+    let mut handled_pinch = false;
+    let mut gesture_changed = false;
+
+    if let Some(touch) = ui.input(|input| input.multi_touch()) {
+        if touch.num_touches >= 2 && rect.contains(touch.center_pos) {
+            handled_pinch = true;
+            *spectrum_pinch_active = true;
+
+            let zoom = f64::from(touch.zoom_delta).clamp(0.25, 4.0);
+            let pan_delta_hz = -f64::from(touch.translation_delta.x) / f64::from(rect.width().max(1.0)) * span_hz;
+            update_state(shared, |s| {
+                if pan_delta_hz.abs() > 1.0 {
+                    s.center_hz = (s.center_hz + pan_delta_hz).clamp(50.0e6, 6000.0e6);
+                    gesture_changed = true;
+                }
+                if (zoom - 1.0).abs() > 0.002 {
+                    let max_bandwidth = s.sample_rate.min(56.0e6).max(0.2e6);
+                    let next = (s.bandwidth_hz / zoom).clamp(0.2e6, max_bandwidth);
+                    if (next - s.bandwidth_hz).abs() > 1.0 {
+                        s.bandwidth_hz = next;
+                        gesture_changed = true;
+                    }
+                }
+            });
+            if gesture_changed {
+                commit_spectrum_gesture(shared, spectrum_last_commit, false);
+            }
+        }
+    }
+
+    if !handled_pinch && *spectrum_pinch_active {
+        *spectrum_pinch_active = false;
+        commit_spectrum_gesture(shared, spectrum_last_commit, true);
+    }
+
+    if handled_pinch {
+        return;
+    }
+
+    if response.dragged() {
+        let pan_delta_hz = -f64::from(response.drag_delta().x) / f64::from(rect.width().max(1.0)) * span_hz;
+        if pan_delta_hz.abs() > 1.0 {
+            update_state(shared, |s| {
+                s.center_hz = (s.center_hz + pan_delta_hz).clamp(50.0e6, 6000.0e6);
+            });
+            commit_spectrum_gesture(shared, spectrum_last_commit, false);
+        }
+    }
+
+    if response.drag_stopped() {
+        commit_spectrum_gesture(shared, spectrum_last_commit, true);
+    }
+}
+
+fn commit_spectrum_gesture(
+    shared: &SharedState,
+    spectrum_last_commit: &mut Option<Instant>,
+    force: bool,
+) {
+    let now = Instant::now();
+    if !force
+        && spectrum_last_commit
+            .map(|last| now.duration_since(last) < SPECTRUM_GESTURE_DEBOUNCE)
+            .unwrap_or(false)
+    {
+        return;
+    }
+    *spectrum_last_commit = Some(now);
+    update_state(shared, |s| {
+        s.bandwidth_hz = s.bandwidth_hz.clamp(0.2e6, s.sample_rate.min(56.0e6).max(0.2e6));
+        s.config_revision = s.config_revision.wrapping_add(1);
+        s.detail = format!(
+            "Pending tune: {:.6} MHz / {:.3} MHz BW / {:.3} MS/s / {:.1} dB",
+            s.center_hz / 1e6,
+            s.bandwidth_hz / 1e6,
+            s.sample_rate / 1e6,
+            s.gain_db
+        );
+    });
 }
 
 fn draw_grid(painter: &egui::Painter, rect: egui::Rect) {
@@ -766,7 +1187,7 @@ fn draw_waterfall(ui: &mut egui::Ui, state: &SdrUiState) {
     let row_h = rect.height() / WATERFALL_ROWS as f32;
     let bin_w = rect.width() / bins as f32;
 
-    if state.streaming && !state.waterfall.is_empty() {
+    if !state.waterfall.is_empty() {
         for (r, spectrum) in state.waterfall.iter().rev().enumerate() {
             let y0 = rect.bottom() - (r as f32 + 1.0) * row_h;
             if y0 < rect.top() {
