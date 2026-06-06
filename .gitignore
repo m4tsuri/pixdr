@@ -10,9 +10,6 @@
 /app/assets/*
 !/app/assets/README.md
 
-# Legacy/generated native workspace, should not be used by scripts
-/build-uhd/
-
 # Logs / temporary files
 *.log
 *.tmp
