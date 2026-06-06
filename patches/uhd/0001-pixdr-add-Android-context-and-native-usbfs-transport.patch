@@ -1,22 +1,22 @@
-From 42e566d7d0e38f196a3fd5815eb8584180261cd4 Mon Sep 17 00:00:00 2001
+From d79040b33aaf5db02a70946f5a73c647e81f92f0 Mon Sep 17 00:00:00 2001
 From: M4tsuri <me@m4tsuri.com>
 Date: Sat, 6 Jun 2026 15:33:21 +0800
 Subject: [PATCH] pixdr: add Android context and native usbfs transport
 
 ---
- .../uhd/transport/android_usb_context.hpp     |  35 ++
+ .../uhd/transport/android_usb_context.hpp     |  35 +
  .../uhd/transport/usb_device_handle.hpp       |   4 +
  host/lib/transport/CMakeLists.txt             |   3 +
  host/lib/transport/android_usb_context.cpp    |  39 ++
- host/lib/transport/android_usbfs.cpp          | 436 ++++++++++++++++++
- host/lib/transport/android_usbfs.hpp          |  78 ++++
+ host/lib/transport/android_usbfs.cpp          | 597 ++++++++++++++++++
+ host/lib/transport/android_usbfs.hpp          |  73 +++
  host/lib/transport/libusb1_control.cpp        |   5 +
  host/lib/transport/libusb1_zero_copy.cpp      |  10 +
  host/lib/usrp/b200/b200_iface.cpp             |  35 +-
  host/lib/usrp/b200/b200_impl.cpp              |  76 ++-
  host/lib/utils/pathslib.cpp                   |   4 +-
  host/lib/utils/platform.cpp                   |   3 +
- 12 files changed, 701 insertions(+), 27 deletions(-)
+ 12 files changed, 857 insertions(+), 27 deletions(-)
  create mode 100644 host/include/uhd/transport/android_usb_context.hpp
  create mode 100644 host/lib/transport/android_usb_context.cpp
  create mode 100644 host/lib/transport/android_usbfs.cpp
@@ -139,10 +139,10 @@ index 0000000..dc9695f
 +}} // namespace uhd::transport
 diff --git a/host/lib/transport/android_usbfs.cpp b/host/lib/transport/android_usbfs.cpp
 new file mode 100644
-index 0000000..30a9581
+index 0000000..216a564
 --- /dev/null
 +++ b/host/lib/transport/android_usbfs.cpp
-@@ -0,0 +1,436 @@
+@@ -0,0 +1,597 @@
 +//
 +// Copyright 2026 pixdr contributors
 +//
@@ -156,12 +156,17 @@ index 0000000..30a9581
 +#include <uhd/utils/log.hpp>
 +#include <boost/circular_buffer.hpp>
 +#include <boost/format.hpp>
++#include <atomic>
 +#include <cerrno>
 +#include <chrono>
++#include <condition_variable>
++#include <cstdlib>
 +#include <cstring>
++#include <deque>
 +#include <linux/usbdevice_fs.h>
 +#include <mutex>
 +#include <sys/ioctl.h>
++#include <thread>
 +#include <unistd.h>
 +
 +using namespace uhd;
@@ -170,15 +175,6 @@ index 0000000..30a9581
 +namespace {
 +static const size_t DEFAULT_NUM_XFERS = 16;
 +static const size_t DEFAULT_XFER_SIZE = 32 * 512;
-+
-+static uint32_t timeout_ms_from_seconds(double timeout)
-+{
-+    if (timeout < 0.0) {
-+        return 0; // usbfs convention: 0 means wait forever
-+    }
-+    uint32_t timeout_ms = static_cast<uint32_t>(timeout * 1000.0);
-+    return timeout_ms == 0 ? 1 : timeout_ms;
-+}
 +
 +static std::string errno_string(const char* op)
 +{
@@ -321,25 +317,6 @@ index 0000000..30a9581
 +    return ret;
 +}
 +
-+int android_usbfs_device_handle::bulk_transfer(unsigned char endpoint,
-+    unsigned char* buff,
-+    unsigned int length,
-+    unsigned int timeout_ms)
-+{
-+    usbdevfs_bulktransfer bulk;
-+    std::memset(&bulk, 0, sizeof(bulk));
-+    bulk.ep      = endpoint;
-+    bulk.len     = length;
-+    bulk.timeout = timeout_ms;
-+    bulk.data    = buff;
-+
-+    int ret = ioctl(_fd, USBDEVFS_BULK, &bulk);
-+    if (ret < 0) {
-+        return -errno;
-+    }
-+    return ret;
-+}
-+
 +android_usbfs_device_handle::sptr android_usbfs_device_handle::from_usb_device_handle(
 +    const usb_device_handle::sptr& handle)
 +{
@@ -379,20 +356,41 @@ index 0000000..30a9581
 +    return usb_control::sptr(new android_usbfs_control_impl(handle, interface));
 +}
 +
++class android_usbfs_zero_copy_impl;
++
++struct android_usbfs_urb_slot
++{
++    android_usbfs_urb_slot()
++        : urb(static_cast<usbdevfs_urb*>(std::calloc(1, sizeof(usbdevfs_urb))))
++    {
++        UHD_ASSERT_THROW(urb != nullptr);
++    }
++
++    ~android_usbfs_urb_slot()
++    {
++        std::free(urb);
++    }
++
++    usbdevfs_urb* urb                  = nullptr;
++    android_usbfs_zero_copy_impl* owner = nullptr;
++    bool is_recv                       = false;
++    size_t index                       = 0;
++    std::atomic<bool> in_flight{false};
++};
++
 +class android_usbfs_recv_mb : public managed_recv_buffer
 +{
 +public:
-+    android_usbfs_recv_mb(void* buffer, size_t capacity)
++    android_usbfs_recv_mb(void* buffer, size_t capacity, android_usbfs_zero_copy_impl* owner, size_t index)
 +        : _capacity(capacity)
++        , _owner(owner)
++        , _index(index)
 +    {
 +        _buffer = buffer;
 +        _length = capacity;
 +    }
 +
-+    void release() override
-+    {
-+        // Buffer is owned by the transport pool and reused by index.
-+    }
++    void release() override;
 +
 +    managed_recv_buffer::sptr make_with_length(size_t length)
 +    {
@@ -406,39 +404,23 @@ index 0000000..30a9581
 +
 +private:
 +    size_t _capacity;
++    android_usbfs_zero_copy_impl* _owner;
++    size_t _index;
 +};
 +
 +class android_usbfs_send_mb : public managed_send_buffer
 +{
 +public:
-+    android_usbfs_send_mb(void* buffer,
-+        size_t capacity,
-+        android_usbfs_device_handle::sptr handle,
-+        unsigned char endpoint,
-+        uint32_t timeout_ms)
++    android_usbfs_send_mb(void* buffer, size_t capacity, android_usbfs_zero_copy_impl* owner, size_t index)
 +        : _capacity(capacity)
-+        , _handle(std::move(handle))
-+        , _endpoint(endpoint)
-+        , _timeout_ms(timeout_ms)
++        , _owner(owner)
++        , _index(index)
 +    {
 +        _buffer = buffer;
 +        _length = capacity;
 +    }
 +
-+    void release() override
-+    {
-+        const size_t nbytes = size();
-+        if (nbytes == 0) {
-+            return;
-+        }
-+        int ret = _handle->bulk_transfer(
-+            _endpoint, static_cast<unsigned char*>(_buffer), unsigned(nbytes), _timeout_ms);
-+        if (ret < 0) {
-+            UHD_LOGGER_WARNING("USB") << "Android usbfs bulk OUT ep=0x" << std::hex
-+                                      << int(_endpoint) << std::dec << " failed: " << -ret;
-+        }
-+        _length = _capacity;
-+    }
++    void release() override;
 +
 +    managed_send_buffer::sptr make_empty()
 +    {
@@ -447,9 +429,8 @@ index 0000000..30a9581
 +
 +private:
 +    size_t _capacity;
-+    android_usbfs_device_handle::sptr _handle;
-+    unsigned char _endpoint;
-+    uint32_t _timeout_ms;
++    android_usbfs_zero_copy_impl* _owner;
++    size_t _index;
 +};
 +
 +class android_usbfs_zero_copy_impl : public usb_zero_copy
@@ -475,42 +456,105 @@ index 0000000..30a9581
 +        _handle->claim_interface(send_interface);
 +        _handle->clear_endpoints(_recv_endpoint, _send_endpoint);
 +
++        _recv_slots.reserve(_num_recv_frames);
++        _send_slots.reserve(_num_send_frames);
 +        for (size_t i = 0; i < _num_recv_frames; i++) {
++            _recv_slots.push_back(std::make_shared<android_usbfs_urb_slot>());
++            _recv_slots.back()->owner   = this;
++            _recv_slots.back()->is_recv = true;
++            _recv_slots.back()->index   = i;
 +            _recv_mbs.push_back(std::make_shared<android_usbfs_recv_mb>(
-+                _recv_pool->at(i), _recv_frame_size));
++                _recv_pool->at(i), _recv_frame_size, this, i));
 +        }
 +        for (size_t i = 0; i < _num_send_frames; i++) {
-+            _send_mbs.push_back(std::make_shared<android_usbfs_send_mb>(_send_pool->at(i),
-+                _send_frame_size,
-+                _handle,
-+                _send_endpoint,
-+                1000));
++            _send_slots.push_back(std::make_shared<android_usbfs_urb_slot>());
++            _send_slots.back()->owner   = this;
++            _send_slots.back()->is_recv = false;
++            _send_slots.back()->index   = i;
++            _send_mbs.push_back(std::make_shared<android_usbfs_send_mb>(
++                _send_pool->at(i), _send_frame_size, this, i));
++            _send_free.push_back(i);
++        }
++
++        _reaper_thread = std::thread([this]() { this->reap_loop(); });
++        for (size_t i = 0; i < _num_recv_frames; i++) {
++            submit_recv(i);
++        }
++    }
++
++    ~android_usbfs_zero_copy_impl() override
++    {
++        _stopping.store(true);
++        for (const auto& slot : _recv_slots) {
++            if (slot->in_flight.load()) {
++                ioctl(_handle->fd(), USBDEVFS_DISCARDURB, slot->urb);
++            }
++        }
++        for (const auto& slot : _send_slots) {
++            if (slot->in_flight.load()) {
++                ioctl(_handle->fd(), USBDEVFS_DISCARDURB, slot->urb);
++            }
++        }
++        if (_reaper_thread.joinable()) {
++            _reaper_thread.join();
 +        }
 +    }
 +
 +    managed_recv_buffer::sptr get_recv_buff(double timeout) override
 +    {
-+        std::lock_guard<std::mutex> lock(_recv_mutex);
-+        android_usbfs_recv_mb& mb = *_recv_mbs[_next_recv++ % _recv_mbs.size()];
-+        int ret                  = _handle->bulk_transfer(_recv_endpoint,
-+            static_cast<unsigned char*>(_recv_pool->at((_next_recv - 1) % _recv_mbs.size())),
-+            unsigned(mb.capacity()),
-+            timeout_ms_from_seconds(timeout));
-+        if (ret == -ETIMEDOUT || ret == -EAGAIN) {
++        std::unique_lock<std::mutex> lock(_recv_mutex);
++        if (_recv_ready.empty()) {
++            if (timeout < 0.0) {
++                _recv_cv.wait(lock, [this]() { return !_recv_ready.empty() || _stopping.load(); });
++            } else {
++                _recv_cv.wait_for(lock,
++                    std::chrono::microseconds(static_cast<int64_t>(timeout * 1e6)),
++                    [this]() { return !_recv_ready.empty() || _stopping.load(); });
++            }
++        }
++        if (_recv_ready.empty()) {
 +            return managed_recv_buffer::sptr();
 +        }
-+        if (ret < 0) {
-+            UHD_LOGGER_WARNING("USB") << "Android usbfs bulk IN ep=0x" << std::hex
-+                                      << int(_recv_endpoint) << std::dec << " failed: " << -ret;
-+            return managed_recv_buffer::sptr();
-+        }
-+        return mb.make_with_length(size_t(ret));
++        const size_t index = _recv_ready.front();
++        _recv_ready.pop_front();
++        const int actual_length = _recv_slots[index]->urb->actual_length;
++        return _recv_mbs[index]->make_with_length(size_t(actual_length > 0 ? actual_length : 0));
 +    }
 +
-+    managed_send_buffer::sptr get_send_buff(double) override
++    managed_send_buffer::sptr get_send_buff(double timeout) override
 +    {
-+        std::lock_guard<std::mutex> lock(_send_mutex);
-+        return _send_mbs[_next_send++ % _send_mbs.size()]->make_empty();
++        std::unique_lock<std::mutex> lock(_send_mutex);
++        if (_send_free.empty()) {
++            if (timeout < 0.0) {
++                _send_cv.wait(lock, [this]() { return !_send_free.empty() || _stopping.load(); });
++            } else {
++                _send_cv.wait_for(lock,
++                    std::chrono::microseconds(static_cast<int64_t>(timeout * 1e6)),
++                    [this]() { return !_send_free.empty() || _stopping.load(); });
++            }
++        }
++        if (_send_free.empty()) {
++            return managed_send_buffer::sptr();
++        }
++        const size_t index = _send_free.front();
++        _send_free.pop_front();
++        return _send_mbs[index]->make_empty();
++    }
++
++    void release_recv(size_t index)
++    {
++        if (!_stopping.load()) {
++            submit_recv(index);
++        }
++    }
++
++    void release_send(size_t index, size_t nbytes)
++    {
++        if (_stopping.load() || nbytes == 0) {
++            mark_send_free(index);
++            return;
++        }
++        submit_send(index, nbytes);
 +    }
 +
 +    size_t get_num_recv_frames(void) const override
@@ -543,13 +587,130 @@ index 0000000..30a9581
 +    size_t _send_frame_size;
 +    buffer_pool::sptr _recv_pool;
 +    buffer_pool::sptr _send_pool;
++    std::vector<std::shared_ptr<android_usbfs_urb_slot>> _recv_slots;
++    std::vector<std::shared_ptr<android_usbfs_urb_slot>> _send_slots;
 +    std::vector<std::shared_ptr<android_usbfs_recv_mb>> _recv_mbs;
 +    std::vector<std::shared_ptr<android_usbfs_send_mb>> _send_mbs;
-+    size_t _next_recv = 0;
-+    size_t _next_send = 0;
++    std::deque<size_t> _recv_ready;
++    std::deque<size_t> _send_free;
 +    std::mutex _recv_mutex;
 +    std::mutex _send_mutex;
++    std::condition_variable _recv_cv;
++    std::condition_variable _send_cv;
++    std::thread _reaper_thread;
++    std::atomic<bool> _stopping{false};
++
++    void init_urb(android_usbfs_urb_slot& slot, unsigned char endpoint, void* buffer, size_t length)
++    {
++        std::memset(slot.urb, 0, sizeof(*slot.urb));
++        slot.urb->type          = USBDEVFS_URB_TYPE_BULK;
++        slot.urb->endpoint      = endpoint;
++        slot.urb->buffer        = buffer;
++        slot.urb->buffer_length = int(length);
++        slot.urb->usercontext   = &slot;
++    }
++
++    void submit_recv(size_t index)
++    {
++        android_usbfs_urb_slot& slot = *_recv_slots[index];
++        init_urb(slot, _recv_endpoint, _recv_pool->at(index), _recv_frame_size);
++        submit_slot(slot, "IN");
++    }
++
++    void submit_send(size_t index, size_t nbytes)
++    {
++        android_usbfs_urb_slot& slot = *_send_slots[index];
++        init_urb(slot, _send_endpoint, _send_pool->at(index), nbytes);
++        if (!submit_slot(slot, "OUT")) {
++            mark_send_free(index);
++        }
++    }
++
++    bool submit_slot(android_usbfs_urb_slot& slot, const char* direction)
++    {
++        slot.in_flight.store(true);
++        if (ioctl(_handle->fd(), USBDEVFS_SUBMITURB, slot.urb) < 0) {
++            slot.in_flight.store(false);
++            UHD_LOGGER_WARNING("USB") << "Android USBDEVFS_SUBMITURB " << direction
++                                      << " ep=0x" << std::hex << int(slot.urb->endpoint)
++                                      << std::dec << " failed: errno=" << errno;
++            return false;
++        }
++        return true;
++    }
++
++    void reap_loop()
++    {
++        while (!_stopping.load()) {
++            usbdevfs_urb* completed = nullptr;
++            int ret = ioctl(_handle->fd(), USBDEVFS_REAPURBNDELAY, &completed);
++            if (ret < 0) {
++                if (errno == EAGAIN || errno == EWOULDBLOCK) {
++                    std::this_thread::sleep_for(std::chrono::microseconds(250));
++                    continue;
++                }
++                UHD_LOGGER_WARNING("USB") << "Android USBDEVFS_REAPURBNDELAY failed: errno="
++                                          << errno;
++                std::this_thread::sleep_for(std::chrono::milliseconds(1));
++                continue;
++            }
++            if (!completed || !completed->usercontext) {
++                continue;
++            }
++            auto* slot = static_cast<android_usbfs_urb_slot*>(completed->usercontext);
++            complete_slot(*slot);
++        }
++    }
++
++    void complete_slot(android_usbfs_urb_slot& slot)
++    {
++        slot.in_flight.store(false);
++        if (_stopping.load()) {
++            return;
++        }
++
++        if (slot.is_recv) {
++            if (slot.urb->status == 0 && slot.urb->actual_length > 0) {
++                {
++                    std::lock_guard<std::mutex> lock(_recv_mutex);
++                    _recv_ready.push_back(slot.index);
++                }
++                _recv_cv.notify_one();
++            } else {
++                if (slot.urb->status != -ENOENT && slot.urb->status != -ECONNRESET) {
++                    UHD_LOGGER_TRACE("USB") << "Android usbfs IN URB status=" << slot.urb->status;
++                }
++                submit_recv(slot.index);
++            }
++        } else {
++            if (slot.urb->status != 0 && slot.urb->status != -ENOENT && slot.urb->status != -ECONNRESET) {
++                UHD_LOGGER_WARNING("USB") << "Android usbfs OUT URB status=" << slot.urb->status;
++            }
++            mark_send_free(slot.index);
++        }
++    }
++
++    void mark_send_free(size_t index)
++    {
++        {
++            std::lock_guard<std::mutex> lock(_send_mutex);
++            _send_free.push_back(index);
++        }
++        _send_cv.notify_one();
++    }
 +};
++
++void android_usbfs_recv_mb::release()
++{
++    _owner->release_recv(_index);
++}
++
++void android_usbfs_send_mb::release()
++{
++    const size_t nbytes = size();
++    _owner->release_send(_index, nbytes);
++    _length = _capacity;
++}
 +
 +usb_zero_copy::sptr uhd::transport::make_android_usbfs_zero_copy(
 +    android_usbfs_device_handle::sptr handle,
@@ -581,10 +742,10 @@ index 0000000..30a9581
 +}
 diff --git a/host/lib/transport/android_usbfs.hpp b/host/lib/transport/android_usbfs.hpp
 new file mode 100644
-index 0000000..1192110
+index 0000000..d425b47
 --- /dev/null
 +++ b/host/lib/transport/android_usbfs.hpp
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,73 @@
 +//
 +// Copyright 2026 pixdr contributors
 +//
@@ -636,11 +797,6 @@ index 0000000..1192110
 +        unsigned char* buff,
 +        uint16_t length,
 +        uint32_t timeout_ms);
-+    int bulk_transfer(unsigned char endpoint,
-+        unsigned char* buff,
-+        unsigned int length,
-+        unsigned int timeout_ms);
-+
 +    static sptr from_usb_device_handle(const usb_device_handle::sptr& handle);
 +
 +private:

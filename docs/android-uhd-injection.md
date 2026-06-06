@@ -38,7 +38,8 @@ normal libusb device.
 Implemented operations:
 
 - control transfers via `USBDEVFS_CONTROL`
-- bulk transfers via `USBDEVFS_BULK`
+- asynchronous bulk streaming via `USBDEVFS_SUBMITURB`,
+  `USBDEVFS_REAPURBNDELAY`, and `USBDEVFS_DISCARDURB`
 - interface claim/release via `USBDEVFS_CLAIMINTERFACE` and
   `USBDEVFS_RELEASEINTERFACE`
 - endpoint clear via `USBDEVFS_CLEAR_HALT`
@@ -47,10 +48,10 @@ Implemented operations:
 The regular libusb transport remains available for desktop/traditional USB
 paths. libusb is now an upstream dependency, not an Android compatibility layer.
 
-## Future performance work
+## Streaming queue
 
-The first native backend uses blocking `USBDEVFS_BULK` calls to satisfy UHD's
-`zero_copy_if` contract. If sustained sample rate becomes the bottleneck, replace
-the bulk implementation with an async URB queue using `USBDEVFS_SUBMITURB`,
-`USBDEVFS_REAPURB`, and `USBDEVFS_DISCARDURB`; this should be an internal change
-to `android_usbfs.cpp` without changing the app/UHD context boundary.
+`android_usbfs.cpp` implements UHD's `zero_copy_if` using reusable RX/TX URB
+slots. RX URBs are pre-submitted and re-submitted when the managed receive
+buffer is released. TX buffers are returned from a free queue and submitted as
+OUT URBs on managed send buffer release. A reaper thread drains completions with
+`USBDEVFS_REAPURBNDELAY` and dispatches slots back to the appropriate queue.
