@@ -38,7 +38,7 @@ export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${CARGO_TARGET_AARCH64_LINUX_A
 
 PIXDR_APK="${PIXDR_APK:-${PIXDR_APP_DIR}/pixdr-debug.apk}"
 PIXDR_PACKAGE="${PIXDR_PACKAGE:-org.pixdr.app}"
-PIXDR_ACTIVITY="${PIXDR_ACTIVITY:-android.app.NativeActivity}"
+PIXDR_ACTIVITY="${PIXDR_ACTIVITY:-org.pixdr.app.PixdrActivity}"
 
 pixdr_require_cmd() {
   local missing=0

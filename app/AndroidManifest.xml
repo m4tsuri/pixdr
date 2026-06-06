@@ -6,12 +6,12 @@
     <uses-feature android:name="android.hardware.usb.host" android:required="true" />
 
     <application
-        android:hasCode="false"
+        android:hasCode="true"
         android:label="Pixdr"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
         <activity
-            android:name="android.app.NativeActivity"
+            android:name="org.pixdr.app.PixdrActivity"
             android:exported="true"
             android:launchMode="singleTask"
             android:configChanges="orientation|keyboardHidden|screenSize">
