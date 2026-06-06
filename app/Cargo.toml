@@ -17,6 +17,7 @@ anyhow = "1"
 num-complex = "0.4"
 rustfft = "6"
 cxx = "1"
+futuresdr = { path = "../external/FutureSDR", default-features = false }
 
 [build-dependencies]
 cxx-build = "1"

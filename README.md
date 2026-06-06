@@ -8,6 +8,7 @@ Current target setup:
 
 - Android NativeActivity, no Java/Kotlin app code
 - Rust UI with `egui`/`eframe`/`wgpu`
+- FutureSDR flowgraph backend with a custom UHD B210 source block
 - UHD 4.10 built for Android arm64
 - B200/B210 Android USB fd handoff flow inspired by GNU Radio's GrHardwareService
 - B210 firmware/FPGA loading through UHD
@@ -22,6 +23,7 @@ pixdr/
     libusb/               upstream libusb, tag v1.0.27
     uhd-rs/               m4tsuri/uhd-rust, branch pixdr-android
     boost-android/        m4tsuri/Boost-for-Android, branch pixdr-android
+    FutureSDR/            FutureSDR runtime used for the receive flowgraph
   build/                  Generated native build/toolchain workspace (ignored)
   docs/                   Project notes and architecture notes
   patches/                format-patch exports of fork changes
@@ -30,7 +32,8 @@ pixdr/
 
 Important app files:
 
-- `app/src/lib.rs` — egui UI, B210 worker, FFT/waterfall display
+- `app/src/lib.rs` — egui UI and B210 worker orchestration
+- `app/src/futuresdr_backend.rs` — FutureSDR UHD source block and spectrum sink block
 - `app/src/usb.rs` — Android USB permission and `UsbDeviceConnection` fd acquisition via JNI
 - `app/src/uhd_wrapper.rs` — UHD init/open using injected Android USB context
 - `app/AndroidManifest.xml` — NativeActivity declaration
@@ -42,7 +45,7 @@ Host tools:
 - Linux host
 - Android SDK with platform 29+ and build-tools 35.x
 - Android NDK r27d extracted to `build/native/android-ndk-r27d` or provided via `PIXDR_NDK=/path/to/ndk`
-- Rust + `cargo-ndk`
+- Rust nightly + `cargo-ndk`
 - `cmake`, `make`, `wget`, `tar`, `zip`, `keytool`
 - `adb`
 
@@ -150,7 +153,8 @@ Expected successful flow:
 4. Android re-enumerates the B210 as `Ettus Research LLC / USRP B200`.
 5. App obtains a new fd.
 6. UHD opens the B210 and loads FPGA.
-7. UI shows live FFT/waterfall when RX streamer is active.
+7. A FutureSDR flowgraph runs a custom UHD B210 source block into the spectrum sink.
+8. UI shows live FFT/waterfall when RX streamer is active.
 
 If the UI says `B210 opened; RX stream failed`, UHD opened the device but RX streamer setup failed. Replugging or restarting the app is often enough while this Android USB path is still being hardened.
 

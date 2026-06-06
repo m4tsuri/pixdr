@@ -13,3 +13,6 @@
 	path = external/boost-android
 	url = https://github.com/m4tsuri/Boost-for-Android.git
 	branch = pixdr-android
+[submodule "external/FutureSDR"]
+	path = external/FutureSDR
+	url = https://github.com/FutureSDR/FutureSDR.git

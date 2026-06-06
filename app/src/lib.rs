@@ -4,7 +4,6 @@ use eframe::{egui, NativeOptions, Renderer};
 use egui_winit::winit;
 use log::{error, info};
 use num_complex::Complex32;
-use rustfft::FftPlanner;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex, OnceLock,
@@ -13,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod android_uhd_context;
+mod futuresdr_backend;
 mod usb;
 mod uhd_wrapper;
 
@@ -160,18 +160,18 @@ fn start_sdr_worker(app: winit::platform::android::activity::AndroidApp, shared:
         let activity = app.activity_as_ptr();
 
         match try_open_b210_once(vm, activity, &shared) {
-            Some(mut usrp) => {
-                if let Err(e) = configure_and_stream(&mut usrp, &shared) {
-                    error!("SDR stream stopped: {e:?}");
-                    update_state(&shared, |s| {
-                        s.status = "B210 opened; RX stream failed".to_string();
-                        s.detail = format!("No live samples: {e}");
-                        s.streaming = false;
-                        // Keep the last spectrum/waterfall frame visible. Retunes and transient
-                        // stream setup failures should look frozen, not like a hard reset.
-                    });
-                    // Keep the USRP handle alive even if streaming setup failed.
-                    loop {
+            Some(usrp) => {
+                let usrp = Arc::new(Mutex::new(usrp));
+                loop {
+                    if let Err(e) = futuresdr_backend::run_b210_flowgraph(usrp.clone(), shared.clone()) {
+                        error!("FutureSDR graph stopped: {e:?}");
+                        update_state(&shared, |s| {
+                            s.status = "B210 opened; RX stream failed".to_string();
+                            s.detail = format!("No live samples: {e}");
+                            s.streaming = false;
+                            // Keep the last spectrum/waterfall frame visible. Retunes and transient
+                            // stream setup failures should look frozen, not like a hard reset.
+                        });
                         thread::sleep(Duration::from_secs(1));
                     }
                 }
@@ -179,103 +179,6 @@ fn start_sdr_worker(app: winit::platform::android::activity::AndroidApp, shared:
             None => thread::sleep(Duration::from_millis(250)),
         }
     });
-}
-
-fn configure_and_stream(usrp: &mut uhd::Usrp, shared: &SharedState) -> anyhow::Result<()> {
-    let _ = usrp.set_rx_antenna("RX2", 0);
-    let _ = usrp.set_rx_dc_offset_enabled(true, 0);
-
-    let mut planner = FftPlanner::<f32>::new();
-    let (mut fft_size, mut publish_interval, mut smoothing, mut applied_fft_revision) = current_fft_config(shared);
-    let mut fft = planner.plan_fft_forward(fft_size);
-    let mut rx_buf = vec![Complex32::new(0.0, 0.0); fft_size];
-    let mut fft_buf = vec![Complex32::new(0.0, 0.0); fft_size];
-    let mut smoothed_spectrum = vec![-100.0; fft_size];
-    let mut last_ui_publish = Instant::now() - publish_interval;
-    update_state(shared, |s| s.applied_fft_revision = applied_fft_revision);
-
-    loop {
-        apply_rx_config(usrp, shared)?;
-
-        let args = uhd::StreamArgs::<Complex32>::builder()
-            .channels(vec![0])
-            .build();
-        let mut streamer = usrp
-            .get_rx_stream(&args)
-            .context("get_rx_stream(channel=0, fc32/sc16) failed")?;
-        streamer
-            .send_command(&uhd::StreamCommand {
-                time: uhd::StreamTime::Now,
-                command_type: uhd::StreamCommandType::StartContinuous,
-            })
-            .context("start continuous RX streaming failed")?;
-
-        info!("UHD RX stream active; computing {fft_size}-point FFT for UI");
-        update_state(shared, |s| {
-            s.status = "Streaming".to_string();
-            s.detail = "UHD RX stream active".to_string();
-            s.streaming = true;
-        });
-
-        loop {
-            let needs_reconfig = shared
-                .lock()
-                .map(|s| s.config_revision != s.applied_revision)
-                .unwrap_or(false);
-            if needs_reconfig {
-                info!("RX config changed; restarting UHD RX streamer");
-                let _ = streamer.send_command(&uhd::StreamCommand {
-                    time: uhd::StreamTime::Now,
-                    command_type: uhd::StreamCommandType::StopContinuous,
-                });
-                update_state(shared, |s| {
-                    s.streaming = false;
-                    s.status = "Retuning".to_string();
-                });
-                break;
-            }
-
-            let (new_fft_size, new_interval, new_smoothing, new_fft_revision) = current_fft_config(shared);
-            if new_fft_revision != applied_fft_revision {
-                fft_size = new_fft_size;
-                publish_interval = new_interval;
-                smoothing = new_smoothing;
-                applied_fft_revision = new_fft_revision;
-                fft = planner.plan_fft_forward(fft_size);
-                rx_buf.resize(fft_size, Complex32::new(0.0, 0.0));
-                fft_buf.resize(fft_size, Complex32::new(0.0, 0.0));
-                smoothed_spectrum.resize(fft_size, -100.0);
-                update_state(shared, |s| {
-                    s.applied_fft_revision = applied_fft_revision;
-                    s.spectrum_db.resize(fft_size, -100.0);
-                    s.waterfall.clear();
-                    s.detail = format!("FFT: {fft_size} bins @ {:.1} FPS", 1.0 / publish_interval.as_secs_f32());
-                });
-                info!("FFT config applied: size={fft_size}, fps={:.1}, smoothing={smoothing:.2}", 1.0 / publish_interval.as_secs_f32());
-            }
-
-            let md = streamer.receive_simple(&mut rx_buf)?;
-            let n = md.samples().min(fft_size);
-            if n == 0 {
-                continue;
-            }
-            // Do not push every UHD packet to the UI: at MHz sample rates that makes
-            // the waterfall scroll too fast and wastes CPU.
-            if last_ui_publish.elapsed() >= publish_interval {
-                fft_buf.fill(Complex32::new(0.0, 0.0));
-                fft_buf[..n].copy_from_slice(&rx_buf[..n]);
-                apply_hann(&mut fft_buf[..n]);
-                fft.process(&mut fft_buf);
-                let spectrum = fft_to_db(&fft_buf);
-                smooth_spectrum(&spectrum, &mut smoothed_spectrum, smoothing);
-                update_spectrum(shared, smoothed_spectrum.clone());
-                last_ui_publish = Instant::now();
-                if shared.lock().map(|s| s.frames % 120 == 0).unwrap_or(false) {
-                    info!("RX FFT frames: {}", shared.lock().map(|s| s.frames).unwrap_or(0));
-                }
-            }
-        }
-    }
 }
 
 fn apply_rx_config(usrp: &mut uhd::Usrp, shared: &SharedState) -> anyhow::Result<()> {
@@ -1162,14 +1065,14 @@ fn draw_grid(painter: &egui::Painter, rect: egui::Rect) {
         let x = rect.left() + rect.width() * i as f32 / 10.0;
         painter.line_segment(
             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-            egui::Stroke::new(0.6, grid),
+            egui::Stroke::new(0.6_f32, grid),
         );
     }
     for i in 1..6 {
         let y = rect.top() + rect.height() * i as f32 / 6.0;
         painter.line_segment(
             [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-            egui::Stroke::new(0.6, grid),
+            egui::Stroke::new(0.6_f32, grid),
         );
     }
 }

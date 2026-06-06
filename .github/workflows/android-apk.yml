@@ -57,7 +57,7 @@ jobs:
             python3
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         with:
           targets: aarch64-linux-android
 
