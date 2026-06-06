@@ -1,0 +1,934 @@
+From 42e566d7d0e38f196a3fd5815eb8584180261cd4 Mon Sep 17 00:00:00 2001
+From: M4tsuri <me@m4tsuri.com>
+Date: Sat, 6 Jun 2026 15:33:21 +0800
+Subject: [PATCH] pixdr: add Android context and native usbfs transport
+
+---
+ .../uhd/transport/android_usb_context.hpp     |  35 ++
+ .../uhd/transport/usb_device_handle.hpp       |   4 +
+ host/lib/transport/CMakeLists.txt             |   3 +
+ host/lib/transport/android_usb_context.cpp    |  39 ++
+ host/lib/transport/android_usbfs.cpp          | 436 ++++++++++++++++++
+ host/lib/transport/android_usbfs.hpp          |  78 ++++
+ host/lib/transport/libusb1_control.cpp        |   5 +
+ host/lib/transport/libusb1_zero_copy.cpp      |  10 +
+ host/lib/usrp/b200/b200_iface.cpp             |  35 +-
+ host/lib/usrp/b200/b200_impl.cpp              |  76 ++-
+ host/lib/utils/pathslib.cpp                   |   4 +-
+ host/lib/utils/platform.cpp                   |   3 +
+ 12 files changed, 701 insertions(+), 27 deletions(-)
+ create mode 100644 host/include/uhd/transport/android_usb_context.hpp
+ create mode 100644 host/lib/transport/android_usb_context.cpp
+ create mode 100644 host/lib/transport/android_usbfs.cpp
+ create mode 100644 host/lib/transport/android_usbfs.hpp
+
+diff --git a/host/include/uhd/transport/android_usb_context.hpp b/host/include/uhd/transport/android_usb_context.hpp
+new file mode 100644
+index 0000000..ec90cfb
+--- /dev/null
++++ b/host/include/uhd/transport/android_usb_context.hpp
+@@ -0,0 +1,35 @@
++//
++// Copyright 2026 pixdr contributors
++//
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++
++#pragma once
++
++#include <cstdint>
++#include <string>
++
++namespace uhd { namespace transport {
++
++// Optional Android USB host context supplied by an embedding application.
++//
++// Android applications cannot enumerate /dev/bus/usb directly under normal
++// SELinux policy. The app owns an already-authorized UsbDeviceConnection and
++// injects its file descriptor here. Desktop builds simply do not provide a
++// context and UHD continues to use normal libusb enumeration.
++class android_usb_context
++{
++public:
++    virtual ~android_usb_context() = default;
++
++    virtual intptr_t fd() const = 0;
++    virtual std::string usbfs_path() const = 0;
++    virtual uint16_t vid() const = 0;
++    virtual uint16_t pid() const = 0;
++    virtual bool firmware_loaded() const = 0;
++};
++
++// Returns nullptr when no Android USB context is available or fd() < 0.
++const android_usb_context* get_android_usb_context();
++
++}} // namespace uhd::transport
+diff --git a/host/include/uhd/transport/usb_device_handle.hpp b/host/include/uhd/transport/usb_device_handle.hpp
+index 3a1446c..8fa6b67 100644
+--- a/host/include/uhd/transport/usb_device_handle.hpp
++++ b/host/include/uhd/transport/usb_device_handle.hpp
+@@ -81,6 +81,10 @@ public:
+     static std::vector<usb_device_handle::sptr> get_device_list(
+         const std::vector<usb_device_handle::vid_pid_pair_t>& vid_pid_pair_list);
+ 
++    // Android: create device handle from fd + path, bypassing libusb enumeration
++    static std::vector<usb_device_handle::sptr> get_device_list(
++        uint16_t vid, uint16_t pid, int fd, const std::string& usbfs_path);
++
+ 
+ }; // namespace usb
+ 
+diff --git a/host/lib/transport/CMakeLists.txt b/host/lib/transport/CMakeLists.txt
+index 396314a..758bb7a 100644
+--- a/host/lib/transport/CMakeLists.txt
++++ b/host/lib/transport/CMakeLists.txt
+@@ -25,6 +25,9 @@ if(ENABLE_USB)
+     include_directories(${LIBUSB_INCLUDE_DIRS})
+     LIBUHD_APPEND_LIBS(${LIBUSB_LIBRARIES})
+     LIBUHD_APPEND_SOURCES(
++        ${CMAKE_CURRENT_SOURCE_DIR}/android_usb_context.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/android_usbfs.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/android_usbfs.hpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/libusb1_control.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/libusb1_zero_copy.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/libusb1_base.cpp
+diff --git a/host/lib/transport/android_usb_context.cpp b/host/lib/transport/android_usb_context.cpp
+new file mode 100644
+index 0000000..dc9695f
+--- /dev/null
++++ b/host/lib/transport/android_usb_context.cpp
+@@ -0,0 +1,39 @@
++//
++// Copyright 2026 pixdr contributors
++//
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++
++#include <uhd/transport/android_usb_context.hpp>
++#include <dlfcn.h>
++
++using uhd::transport::android_usb_context;
++
++extern "C" __attribute__((weak)) const android_usb_context* pixdr_uhd_android_usb_context();
++
++namespace uhd { namespace transport {
++
++const android_usb_context* get_android_usb_context()
++{
++    using provider_t = const android_usb_context* (*)();
++
++    provider_t provider = nullptr;
++    if (pixdr_uhd_android_usb_context) {
++        provider = pixdr_uhd_android_usb_context;
++    } else {
++        provider = reinterpret_cast<provider_t>(
++            dlsym(RTLD_DEFAULT, "pixdr_uhd_android_usb_context"));
++    }
++
++    if (!provider) {
++        return nullptr;
++    }
++
++    const android_usb_context* ctx = provider();
++    if (!ctx || ctx->fd() < 0) {
++        return nullptr;
++    }
++    return ctx;
++}
++
++}} // namespace uhd::transport
+diff --git a/host/lib/transport/android_usbfs.cpp b/host/lib/transport/android_usbfs.cpp
+new file mode 100644
+index 0000000..30a9581
+--- /dev/null
++++ b/host/lib/transport/android_usbfs.cpp
+@@ -0,0 +1,436 @@
++//
++// Copyright 2026 pixdr contributors
++//
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++
++#include "android_usbfs.hpp"
++#include <uhd/exception.hpp>
++#include <uhd/transport/android_usb_context.hpp>
++#include <uhd/transport/buffer_pool.hpp>
++#include <uhd/utils/log.hpp>
++#include <boost/circular_buffer.hpp>
++#include <boost/format.hpp>
++#include <cerrno>
++#include <chrono>
++#include <cstring>
++#include <linux/usbdevice_fs.h>
++#include <mutex>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++using namespace uhd;
++using namespace uhd::transport;
++
++namespace {
++static const size_t DEFAULT_NUM_XFERS = 16;
++static const size_t DEFAULT_XFER_SIZE = 32 * 512;
++
++static uint32_t timeout_ms_from_seconds(double timeout)
++{
++    if (timeout < 0.0) {
++        return 0; // usbfs convention: 0 means wait forever
++    }
++    uint32_t timeout_ms = static_cast<uint32_t>(timeout * 1000.0);
++    return timeout_ms == 0 ? 1 : timeout_ms;
++}
++
++static std::string errno_string(const char* op)
++{
++    return str(boost::format("%s failed: errno=%d (%s)") % op % errno % std::strerror(errno));
++}
++} // namespace
++
++android_usbfs_device_handle::android_usbfs_device_handle(
++    int fd, uint16_t vid, uint16_t pid, std::string usbfs_path, bool firmware_loaded)
++    : _fd(fd)
++    , _vid(vid)
++    , _pid(pid)
++    , _usbfs_path(std::move(usbfs_path))
++    , _firmware_loaded(firmware_loaded)
++{
++}
++
++android_usbfs_device_handle::~android_usbfs_device_handle()
++{
++    try {
++        release_claimed_interfaces();
++    } catch (...) {
++        // NOP: destructors must not throw.
++    }
++}
++
++std::string android_usbfs_device_handle::get_serial() const
++{
++    return "";
++}
++
++std::string android_usbfs_device_handle::get_manufacturer() const
++{
++    return _firmware_loaded ? "Ettus Research LLC" : "Cypress";
++}
++
++std::string android_usbfs_device_handle::get_product() const
++{
++    return _firmware_loaded ? "USRP B200/B210" : "WestBridge";
++}
++
++uint16_t android_usbfs_device_handle::get_vendor_id() const
++{
++    return _vid;
++}
++
++uint16_t android_usbfs_device_handle::get_product_id() const
++{
++    return _pid;
++}
++
++bool android_usbfs_device_handle::firmware_loaded()
++{
++    return _firmware_loaded;
++}
++
++int android_usbfs_device_handle::fd() const
++{
++    return _fd;
++}
++
++const std::string& android_usbfs_device_handle::usbfs_path() const
++{
++    return _usbfs_path;
++}
++
++void android_usbfs_device_handle::claim_interface(int interface)
++{
++    std::lock_guard<std::mutex> lock(_mutex);
++    if (_claimed_interfaces.count(interface)) {
++        return;
++    }
++
++    unsigned int ifno = static_cast<unsigned int>(interface);
++    if (ioctl(_fd, USBDEVFS_CLAIMINTERFACE, &ifno) < 0) {
++        if (errno != EBUSY) {
++            throw uhd::os_error(errno_string("USBDEVFS_CLAIMINTERFACE"));
++        }
++        UHD_LOGGER_WARNING("USB") << "Android usbfs interface " << interface
++                                  << " already claimed (continuing)";
++    }
++    _claimed_interfaces.insert(interface);
++}
++
++void android_usbfs_device_handle::release_claimed_interfaces()
++{
++    std::lock_guard<std::mutex> lock(_mutex);
++    for (int interface : _claimed_interfaces) {
++        unsigned int ifno = static_cast<unsigned int>(interface);
++        ioctl(_fd, USBDEVFS_RELEASEINTERFACE, &ifno);
++    }
++    _claimed_interfaces.clear();
++}
++
++void android_usbfs_device_handle::clear_endpoint(unsigned char endpoint)
++{
++    unsigned int ep = endpoint;
++    if (ioctl(_fd, USBDEVFS_CLEAR_HALT, &ep) < 0) {
++        UHD_LOGGER_TRACE("USB") << "Android USBDEVFS_CLEAR_HALT ep=0x" << std::hex
++                                << int(endpoint) << std::dec << " failed: errno=" << errno;
++    }
++}
++
++void android_usbfs_device_handle::clear_endpoints(
++    unsigned char recv_endpoint, unsigned char send_endpoint)
++{
++    clear_endpoint(recv_endpoint | 0x80);
++    clear_endpoint(send_endpoint | 0x00);
++}
++
++void android_usbfs_device_handle::reset_device()
++{
++    if (ioctl(_fd, USBDEVFS_RESET, 0) < 0) {
++        UHD_LOGGER_TRACE("USB") << "Android USBDEVFS_RESET failed: errno=" << errno;
++    }
++}
++
++int android_usbfs_device_handle::control_transfer(uint8_t request_type,
++    uint8_t request,
++    uint16_t value,
++    uint16_t index,
++    unsigned char* buff,
++    uint16_t length,
++    uint32_t timeout_ms)
++{
++    usbdevfs_ctrltransfer ctrl;
++    std::memset(&ctrl, 0, sizeof(ctrl));
++    ctrl.bRequestType = request_type;
++    ctrl.bRequest     = request;
++    ctrl.wValue       = value;
++    ctrl.wIndex       = index;
++    ctrl.wLength      = length;
++    ctrl.timeout      = timeout_ms;
++    ctrl.data         = buff;
++
++    int ret = ioctl(_fd, USBDEVFS_CONTROL, &ctrl);
++    if (ret < 0) {
++        return -errno;
++    }
++    return ret;
++}
++
++int android_usbfs_device_handle::bulk_transfer(unsigned char endpoint,
++    unsigned char* buff,
++    unsigned int length,
++    unsigned int timeout_ms)
++{
++    usbdevfs_bulktransfer bulk;
++    std::memset(&bulk, 0, sizeof(bulk));
++    bulk.ep      = endpoint;
++    bulk.len     = length;
++    bulk.timeout = timeout_ms;
++    bulk.data    = buff;
++
++    int ret = ioctl(_fd, USBDEVFS_BULK, &bulk);
++    if (ret < 0) {
++        return -errno;
++    }
++    return ret;
++}
++
++android_usbfs_device_handle::sptr android_usbfs_device_handle::from_usb_device_handle(
++    const usb_device_handle::sptr& handle)
++{
++    return std::dynamic_pointer_cast<android_usbfs_device_handle>(handle);
++}
++
++class android_usbfs_control_impl : public usb_control
++{
++public:
++    android_usbfs_control_impl(android_usbfs_device_handle::sptr handle, int interface)
++        : _handle(std::move(handle))
++    {
++        _handle->claim_interface(interface);
++    }
++
++    int submit(uint8_t request_type,
++        uint8_t request,
++        uint16_t value,
++        uint16_t index,
++        unsigned char* buff,
++        uint16_t length,
++        uint32_t timeout = 0) override
++    {
++        std::lock_guard<std::mutex> lock(_mutex);
++        return _handle->control_transfer(
++            request_type, request, value, index, buff, length, timeout);
++    }
++
++private:
++    android_usbfs_device_handle::sptr _handle;
++    std::mutex _mutex;
++};
++
++usb_control::sptr uhd::transport::make_android_usbfs_control(
++    const android_usbfs_device_handle::sptr& handle, int interface)
++{
++    return usb_control::sptr(new android_usbfs_control_impl(handle, interface));
++}
++
++class android_usbfs_recv_mb : public managed_recv_buffer
++{
++public:
++    android_usbfs_recv_mb(void* buffer, size_t capacity)
++        : _capacity(capacity)
++    {
++        _buffer = buffer;
++        _length = capacity;
++    }
++
++    void release() override
++    {
++        // Buffer is owned by the transport pool and reused by index.
++    }
++
++    managed_recv_buffer::sptr make_with_length(size_t length)
++    {
++        return make<managed_recv_buffer>(this, _buffer, length);
++    }
++
++    size_t capacity() const
++    {
++        return _capacity;
++    }
++
++private:
++    size_t _capacity;
++};
++
++class android_usbfs_send_mb : public managed_send_buffer
++{
++public:
++    android_usbfs_send_mb(void* buffer,
++        size_t capacity,
++        android_usbfs_device_handle::sptr handle,
++        unsigned char endpoint,
++        uint32_t timeout_ms)
++        : _capacity(capacity)
++        , _handle(std::move(handle))
++        , _endpoint(endpoint)
++        , _timeout_ms(timeout_ms)
++    {
++        _buffer = buffer;
++        _length = capacity;
++    }
++
++    void release() override
++    {
++        const size_t nbytes = size();
++        if (nbytes == 0) {
++            return;
++        }
++        int ret = _handle->bulk_transfer(
++            _endpoint, static_cast<unsigned char*>(_buffer), unsigned(nbytes), _timeout_ms);
++        if (ret < 0) {
++            UHD_LOGGER_WARNING("USB") << "Android usbfs bulk OUT ep=0x" << std::hex
++                                      << int(_endpoint) << std::dec << " failed: " << -ret;
++        }
++        _length = _capacity;
++    }
++
++    managed_send_buffer::sptr make_empty()
++    {
++        return make<managed_send_buffer>(this, _buffer, _capacity);
++    }
++
++private:
++    size_t _capacity;
++    android_usbfs_device_handle::sptr _handle;
++    unsigned char _endpoint;
++    uint32_t _timeout_ms;
++};
++
++class android_usbfs_zero_copy_impl : public usb_zero_copy
++{
++public:
++    android_usbfs_zero_copy_impl(android_usbfs_device_handle::sptr handle,
++        int recv_interface,
++        unsigned char recv_endpoint,
++        int send_interface,
++        unsigned char send_endpoint,
++        const device_addr_t& hints)
++        : _handle(std::move(handle))
++        , _recv_endpoint((recv_endpoint & 0x7f) | 0x80)
++        , _send_endpoint((send_endpoint & 0x7f) | 0x00)
++        , _num_recv_frames(size_t(hints.cast<double>("num_recv_frames", DEFAULT_NUM_XFERS)))
++        , _num_send_frames(size_t(hints.cast<double>("num_send_frames", DEFAULT_NUM_XFERS)))
++        , _recv_frame_size(size_t(hints.cast<double>("recv_frame_size", DEFAULT_XFER_SIZE)))
++        , _send_frame_size(size_t(hints.cast<double>("send_frame_size", DEFAULT_XFER_SIZE)))
++        , _recv_pool(buffer_pool::make(_num_recv_frames, _recv_frame_size))
++        , _send_pool(buffer_pool::make(_num_send_frames, _send_frame_size))
++    {
++        _handle->claim_interface(recv_interface);
++        _handle->claim_interface(send_interface);
++        _handle->clear_endpoints(_recv_endpoint, _send_endpoint);
++
++        for (size_t i = 0; i < _num_recv_frames; i++) {
++            _recv_mbs.push_back(std::make_shared<android_usbfs_recv_mb>(
++                _recv_pool->at(i), _recv_frame_size));
++        }
++        for (size_t i = 0; i < _num_send_frames; i++) {
++            _send_mbs.push_back(std::make_shared<android_usbfs_send_mb>(_send_pool->at(i),
++                _send_frame_size,
++                _handle,
++                _send_endpoint,
++                1000));
++        }
++    }
++
++    managed_recv_buffer::sptr get_recv_buff(double timeout) override
++    {
++        std::lock_guard<std::mutex> lock(_recv_mutex);
++        android_usbfs_recv_mb& mb = *_recv_mbs[_next_recv++ % _recv_mbs.size()];
++        int ret                  = _handle->bulk_transfer(_recv_endpoint,
++            static_cast<unsigned char*>(_recv_pool->at((_next_recv - 1) % _recv_mbs.size())),
++            unsigned(mb.capacity()),
++            timeout_ms_from_seconds(timeout));
++        if (ret == -ETIMEDOUT || ret == -EAGAIN) {
++            return managed_recv_buffer::sptr();
++        }
++        if (ret < 0) {
++            UHD_LOGGER_WARNING("USB") << "Android usbfs bulk IN ep=0x" << std::hex
++                                      << int(_recv_endpoint) << std::dec << " failed: " << -ret;
++            return managed_recv_buffer::sptr();
++        }
++        return mb.make_with_length(size_t(ret));
++    }
++
++    managed_send_buffer::sptr get_send_buff(double) override
++    {
++        std::lock_guard<std::mutex> lock(_send_mutex);
++        return _send_mbs[_next_send++ % _send_mbs.size()]->make_empty();
++    }
++
++    size_t get_num_recv_frames(void) const override
++    {
++        return _num_recv_frames;
++    }
++
++    size_t get_recv_frame_size(void) const override
++    {
++        return _recv_frame_size;
++    }
++
++    size_t get_num_send_frames(void) const override
++    {
++        return _num_send_frames;
++    }
++
++    size_t get_send_frame_size(void) const override
++    {
++        return _send_frame_size;
++    }
++
++private:
++    android_usbfs_device_handle::sptr _handle;
++    unsigned char _recv_endpoint;
++    unsigned char _send_endpoint;
++    size_t _num_recv_frames;
++    size_t _num_send_frames;
++    size_t _recv_frame_size;
++    size_t _send_frame_size;
++    buffer_pool::sptr _recv_pool;
++    buffer_pool::sptr _send_pool;
++    std::vector<std::shared_ptr<android_usbfs_recv_mb>> _recv_mbs;
++    std::vector<std::shared_ptr<android_usbfs_send_mb>> _send_mbs;
++    size_t _next_recv = 0;
++    size_t _next_send = 0;
++    std::mutex _recv_mutex;
++    std::mutex _send_mutex;
++};
++
++usb_zero_copy::sptr uhd::transport::make_android_usbfs_zero_copy(
++    android_usbfs_device_handle::sptr handle,
++    int recv_interface,
++    unsigned char recv_endpoint,
++    int send_interface,
++    unsigned char send_endpoint,
++    const device_addr_t& hints)
++{
++    return usb_zero_copy::sptr(new android_usbfs_zero_copy_impl(std::move(handle),
++        recv_interface,
++        recv_endpoint,
++        send_interface,
++        send_endpoint,
++        hints));
++}
++
++std::vector<usb_device_handle::sptr> usb_device_handle::get_device_list(
++    uint16_t vid, uint16_t pid, int fd, const std::string& usbfs_path)
++{
++    std::vector<usb_device_handle::sptr> handles;
++    bool firmware_loaded = false;
++    if (const android_usb_context* ctx = get_android_usb_context()) {
++        firmware_loaded = ctx->firmware_loaded();
++    }
++    handles.push_back(std::make_shared<android_usbfs_device_handle>(
++        fd, vid, pid, usbfs_path, firmware_loaded));
++    return handles;
++}
+diff --git a/host/lib/transport/android_usbfs.hpp b/host/lib/transport/android_usbfs.hpp
+new file mode 100644
+index 0000000..1192110
+--- /dev/null
++++ b/host/lib/transport/android_usbfs.hpp
+@@ -0,0 +1,78 @@
++//
++// Copyright 2026 pixdr contributors
++//
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++
++#pragma once
++
++#include <uhd/transport/usb_control.hpp>
++#include <uhd/transport/usb_device_handle.hpp>
++#include <uhd/transport/usb_zero_copy.hpp>
++#include <uhd/types/device_addr.hpp>
++#include <cstdint>
++#include <memory>
++#include <mutex>
++#include <set>
++#include <string>
++
++namespace uhd { namespace transport {
++
++class android_usbfs_device_handle : public usb_device_handle
++{
++public:
++    typedef std::shared_ptr<android_usbfs_device_handle> sptr;
++
++    android_usbfs_device_handle(
++        int fd, uint16_t vid, uint16_t pid, std::string usbfs_path, bool firmware_loaded);
++    ~android_usbfs_device_handle() override;
++
++    std::string get_serial() const override;
++    std::string get_manufacturer() const override;
++    std::string get_product() const override;
++    uint16_t get_vendor_id() const override;
++    uint16_t get_product_id() const override;
++    bool firmware_loaded() override;
++
++    int fd() const;
++    const std::string& usbfs_path() const;
++
++    void claim_interface(int interface);
++    void release_claimed_interfaces();
++    void clear_endpoint(unsigned char endpoint);
++    void clear_endpoints(unsigned char recv_endpoint, unsigned char send_endpoint);
++    void reset_device();
++    int control_transfer(uint8_t request_type,
++        uint8_t request,
++        uint16_t value,
++        uint16_t index,
++        unsigned char* buff,
++        uint16_t length,
++        uint32_t timeout_ms);
++    int bulk_transfer(unsigned char endpoint,
++        unsigned char* buff,
++        unsigned int length,
++        unsigned int timeout_ms);
++
++    static sptr from_usb_device_handle(const usb_device_handle::sptr& handle);
++
++private:
++    int _fd;
++    uint16_t _vid;
++    uint16_t _pid;
++    std::string _usbfs_path;
++    bool _firmware_loaded;
++    mutable std::mutex _mutex;
++    std::set<int> _claimed_interfaces;
++};
++
++usb_control::sptr make_android_usbfs_control(
++    const android_usbfs_device_handle::sptr& handle, int interface);
++usb_zero_copy::sptr make_android_usbfs_zero_copy(android_usbfs_device_handle::sptr handle,
++    int recv_interface,
++    unsigned char recv_endpoint,
++    int send_interface,
++    unsigned char send_endpoint,
++    const device_addr_t& hints);
++
++}} // namespace uhd::transport
+diff --git a/host/lib/transport/libusb1_control.cpp b/host/lib/transport/libusb1_control.cpp
+index 5d49e39..847b6aa 100644
+--- a/host/lib/transport/libusb1_control.cpp
++++ b/host/lib/transport/libusb1_control.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ //
+ 
++#include "android_usbfs.hpp"
+ #include "libusb1_base.hpp"
+ #include <uhd/transport/usb_control.hpp>
+ #include <mutex>
+@@ -64,6 +65,10 @@ libusb_control_impl::~libusb_control_impl(void)
+  **********************************************************************/
+ usb_control::sptr usb_control::make(usb_device_handle::sptr handle, const int interface)
+ {
++    if (android_usbfs_device_handle::sptr android_handle =
++            android_usbfs_device_handle::from_usb_device_handle(handle)) {
++        return make_android_usbfs_control(android_handle, interface);
++    }
+     return sptr(new libusb_control_impl(
+         libusb::device_handle::get_cached_handle(
+             std::static_pointer_cast<libusb::special_handle>(handle)->get_device()),
+diff --git a/host/lib/transport/libusb1_zero_copy.cpp b/host/lib/transport/libusb1_zero_copy.cpp
+index 8172167..d22f526 100644
+--- a/host/lib/transport/libusb1_zero_copy.cpp
++++ b/host/lib/transport/libusb1_zero_copy.cpp
+@@ -6,6 +6,7 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ //
+ 
++#include "android_usbfs.hpp"
+ #include "libusb1_base.hpp"
+ #include <uhd/exception.hpp>
+ #include <uhd/transport/bounded_buffer.hpp>
+@@ -470,6 +471,15 @@ usb_zero_copy::sptr usb_zero_copy::make(usb_device_handle::sptr handle,
+     const unsigned char send_endpoint,
+     const device_addr_t& hints)
+ {
++    if (android_usbfs_device_handle::sptr android_handle =
++            android_usbfs_device_handle::from_usb_device_handle(handle)) {
++        return make_android_usbfs_zero_copy(android_handle,
++            recv_interface,
++            recv_endpoint,
++            send_interface,
++            send_endpoint,
++            hints);
++    }
+     libusb::device_handle::sptr dev_handle(libusb::device_handle::get_cached_handle(
+         std::static_pointer_cast<libusb::special_handle>(handle)->get_device()));
+     return sptr(new libusb_zero_copy_impl(
+diff --git a/host/lib/usrp/b200/b200_iface.cpp b/host/lib/usrp/b200/b200_iface.cpp
+index 6f4dd8e..b1956b6 100644
+--- a/host/lib/usrp/b200/b200_iface.cpp
++++ b/host/lib/usrp/b200/b200_iface.cpp
+@@ -225,15 +225,34 @@ public:
+         }
+ 
+         ihex_reader file_reader(filestring);
++        size_t fw_records = 0;
++        uint32_t fw_jump_addr = 0;
+         try {
+-            file_reader.read(std::bind(&b200_iface_impl::fx3_control_write,
+-                this,
+-                FX3_FIRMWARE_LOAD,
+-                std::placeholders::_1,
+-                std::placeholders::_2,
+-                std::placeholders::_3,
+-                std::placeholders::_4,
+-                0));
++            file_reader.read([this, &fw_records, &fw_jump_addr](uint16_t value,
++                                 uint16_t index,
++                                 unsigned char* data,
++                                 uint16_t length) -> int {
++                const int ret = this->fx3_control_write(
++                    FX3_FIRMWARE_LOAD, value, index, data, length, 0);
++                if (length == 0) {
++                    fw_jump_addr = (uint32_t(index) << 16) | value;
++                    UHD_LOGGER_INFO("B200") << "FX3 firmware jump address: 0x"
++                                           << std::hex << fw_jump_addr << std::dec
++                                           << " ret=" << ret;
++                    return ret;
++                }
++                fw_records++;
++                if (ret >= 0 && ret != length) {
++                    UHD_LOGGER_ERROR("B200") << "Short FX3 firmware write at 0x"
++                                            << std::hex
++                                            << ((uint32_t(index) << 16) | value)
++                                            << std::dec << ": expected " << length
++                                            << " wrote " << ret;
++                    return -1;
++                }
++                return ret;
++            });
++            UHD_LOGGER_INFO("B200") << "FX3 firmware records written: " << fw_records;
+         } catch (const uhd::io_error& e) {
+             throw uhd::io_error(
+                 str(boost::format("Could not load firmware: \n%s") % e.what()));
+diff --git a/host/lib/usrp/b200/b200_impl.cpp b/host/lib/usrp/b200/b200_impl.cpp
+index b565ad8..f3d785f 100644
+--- a/host/lib/usrp/b200/b200_impl.cpp
++++ b/host/lib/usrp/b200/b200_impl.cpp
+@@ -6,11 +6,13 @@
+ //
+ 
+ #include "b200_impl.hpp"
++#include "../../transport/android_usbfs.hpp"
+ #include "../../transport/libusb1_base.hpp"
+ #include "b200_regs.hpp"
+ #include <uhd/cal/database.hpp>
+ #include <uhd/config.hpp>
+ #include <uhd/exception.hpp>
++#include <uhd/transport/android_usb_context.hpp>
+ #include <uhd/transport/usb_control.hpp>
+ #include <uhd/types/metadata.hpp>
+ #include <uhd/usrp/dboard_eeprom.hpp>
+@@ -173,6 +175,12 @@ std::vector<usb_device_handle::sptr> get_b200_device_handles(const device_addr_t
+     }
+ 
+     // find the usrps and load firmware
++    if (const android_usb_context* ctx = get_android_usb_context()) {
++        uint16_t android_vid = ctx->vid() ? ctx->vid() : B200_VENDOR_ID;
++        uint16_t android_pid = ctx->pid() ? ctx->pid() : B200_PRODUCT_ID;
++        return usb_device_handle::get_device_list(
++            android_vid, android_pid, (int)ctx->fd(), ctx->usbfs_path());
++    }
+     return usb_device_handle::get_device_list(vid_pid_pair_list);
+ }
+ 
+@@ -198,6 +206,16 @@ static device_addrs_t b200_find(const device_addr_t& hint)
+             return b200_addrs;
+     }
+ 
++    const android_usb_context* android_ctx = get_android_usb_context();
++    if (android_ctx && android_ctx->firmware_loaded()) {
++        device_addr_t new_addr;
++        new_addr["type"]    = "b200";
++        new_addr["name"]    = "B200";
++        new_addr["product"] = "B200";
++        b200_addrs.push_back(new_addr);
++        return b200_addrs;
++    }
++
+     // Important note:
+     // The get device list calls are nested inside the for loop.
+     // This allows the usb guts to decontruct when not in use,
+@@ -227,6 +245,10 @@ static device_addrs_t b200_find(const device_addr_t& hint)
+         // check if fw was already loaded
+         if (!(handle->firmware_loaded())) {
+             b200_iface::make(control)->load_firmware(b200_fw_image);
++            if (get_android_usb_context()) {
++                UHD_LOGGER_INFO("B200") << "Android fd firmware load submitted; returning to app for USB re-enumeration";
++                return b200_addrs;
++            }
+         }
+ 
+         found++;
+@@ -280,13 +302,22 @@ static device::sptr b200_make(const device_addr_t& device_addr)
+         return device::sptr(new b200_impl(device_addr, handle));
+     } catch (const uhd::usb_error&) {
+         UHD_LOGGER_INFO("B200") << "Detected bad USB state; resetting.";
+-        libusb::device_handle::sptr dev_handle(libusb::device_handle::get_cached_handle(
+-            std::static_pointer_cast<libusb::special_handle>(handle)->get_device()));
+-        dev_handle->clear_endpoints(
+-            B200_USB_CTRL_RECV_ENDPOINT, B200_USB_CTRL_SEND_ENDPOINT);
+-        dev_handle->clear_endpoints(
+-            B200_USB_DATA_RECV_ENDPOINT, B200_USB_DATA_SEND_ENDPOINT);
+-        dev_handle->reset_device();
++        if (android_usbfs_device_handle::sptr android_handle =
++                android_usbfs_device_handle::from_usb_device_handle(handle)) {
++            android_handle->clear_endpoints(
++                B200_USB_CTRL_RECV_ENDPOINT, B200_USB_CTRL_SEND_ENDPOINT);
++            android_handle->clear_endpoints(
++                B200_USB_DATA_RECV_ENDPOINT, B200_USB_DATA_SEND_ENDPOINT);
++            android_handle->reset_device();
++        } else {
++            libusb::device_handle::sptr dev_handle(libusb::device_handle::get_cached_handle(
++                std::static_pointer_cast<libusb::special_handle>(handle)->get_device()));
++            dev_handle->clear_endpoints(
++                B200_USB_CTRL_RECV_ENDPOINT, B200_USB_CTRL_SEND_ENDPOINT);
++            dev_handle->clear_endpoints(
++                B200_USB_DATA_RECV_ENDPOINT, B200_USB_DATA_SEND_ENDPOINT);
++            dev_handle->reset_device();
++        }
+     }
+ 
+     return device::sptr(new b200_impl(device_addr, handle));
+@@ -375,21 +406,32 @@ b200_impl::b200_impl(
+             usb_device_handle::vid_pid_pair_t(B200_VENDOR_NI_ID, B210_PRODUCT_NI_ID));
+     }
+ 
+-    std::vector<usb_device_handle::sptr> device_list =
+-        usb_device_handle::get_device_list(vid_pid_pair_list);
++    std::vector<usb_device_handle::sptr> device_list;
++
++    if (const android_usb_context* ctx = get_android_usb_context()) {
++        // Android: use fd+path to create device handle (bypasses libusb enum)
++        device_list = usb_device_handle::get_device_list(
++            vid, pid, (int)ctx->fd(), ctx->usbfs_path());
++    } else {
++        device_list = usb_device_handle::get_device_list(vid_pid_pair_list);
++    }
+ 
+     // locate the matching handle in the device list
+-    for (usb_device_handle::sptr dev_handle : device_list) {
+-        try {
+-            if (dev_handle->get_serial() == device_addr["serial"]) {
+-                handle = dev_handle;
+-                break;
++    if (get_android_usb_context() && !device_list.empty() && !device_addr.has_key("serial")) {
++        handle = device_list.front();
++    } else {
++        for (usb_device_handle::sptr dev_handle : device_list) {
++            try {
++                if (dev_handle->get_serial() == device_addr["serial"]) {
++                    handle = dev_handle;
++                    break;
++                }
++            } catch (const uhd::exception&) {
++                continue;
+             }
+-        } catch (const uhd::exception&) {
+-            continue;
+         }
+     }
+-    UHD_ASSERT_THROW(handle.get() != NULL); // better be found
++    UHD_ASSERT_THROW(handle.get() != NULL);
+ 
+     // create control objects
+     usb_control::sptr control = usb_control::make(handle, 0);
+diff --git a/host/lib/utils/pathslib.cpp b/host/lib/utils/pathslib.cpp
+index 04b6e52..b21ba3b 100644
+--- a/host/lib/utils/pathslib.cpp
++++ b/host/lib/utils/pathslib.cpp
+@@ -9,7 +9,7 @@
+ 
+ #ifdef _WIN32
+ #    include <windows.h>
+-#elif defined(__OpenBSD__)
++#elif defined(__OpenBSD__) || defined(__ANDROID__)
+ #    include <glob.h>
+ #else
+ #    include <wordexp.h>
+@@ -29,7 +29,7 @@ std::string uhd::path_expandvars(const std::string& path)
+         return path;
+     }
+     return std::string(result, result + result_len);
+-#elif defined(__OpenBSD__)
++#elif defined(__OpenBSD__) || defined(__ANDROID__)
+     glob_t p;
+     std::string return_value;
+     memset(&p, 0, sizeof(p));
+diff --git a/host/lib/utils/platform.cpp b/host/lib/utils/platform.cpp
+index e12f7ad..e1cde1b 100644
+--- a/host/lib/utils/platform.cpp
++++ b/host/lib/utils/platform.cpp
+@@ -41,6 +41,9 @@ uint32_t get_host_id()
+         sizeof(szFileSysName));
+ 
+     return uint32_t(dwSerialNumber);
++#elif defined(__ANDROID__)
++    // Android Bionic lacks gethostid(); use getpid() as fallback
++    return uint32_t(getpid());
+ #else
+     return uint32_t(gethostid());
+ #endif
+-- 
+2.54.0
+

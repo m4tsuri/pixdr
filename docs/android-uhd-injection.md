@@ -1,7 +1,8 @@
 # Android USB context injection into UHD
 
-pixdr does not mutate exported UHD global variables to pass Android USB state.
-Instead, the app injects a context object into the UHD fork.
+pixdr does not mutate exported UHD global variables and does not patch libusb for
+Android fd compatibility. Android-specific USB behavior lives in the UHD fork as
+an optional native usbfs transport.
 
 ## Boundary
 
@@ -28,5 +29,28 @@ Instead, the app injects a context object into the UHD fork.
 - USB VID/PID
 - FX3 firmware-loaded state
 
-This keeps Android-specific state at the application edge and leaves UHD with a
-small optional host-context interface rather than process-wide mutable globals.
+## UHD-native Android usbfs transport
+
+When an Android context is present, B200 discovery/open uses
+`host/lib/transport/android_usbfs.cpp` instead of pretending the Android fd is a
+normal libusb device.
+
+Implemented operations:
+
+- control transfers via `USBDEVFS_CONTROL`
+- bulk transfers via `USBDEVFS_BULK`
+- interface claim/release via `USBDEVFS_CLAIMINTERFACE` and
+  `USBDEVFS_RELEASEINTERFACE`
+- endpoint clear via `USBDEVFS_CLEAR_HALT`
+- device reset via `USBDEVFS_RESET`
+
+The regular libusb transport remains available for desktop/traditional USB
+paths. libusb is now an upstream dependency, not an Android compatibility layer.
+
+## Future performance work
+
+The first native backend uses blocking `USBDEVFS_BULK` calls to satisfy UHD's
+`zero_copy_if` contract. If sustained sample rate becomes the bottleneck, replace
+the bulk implementation with an async URB queue using `USBDEVFS_SUBMITURB`,
+`USBDEVFS_REAPURB`, and `USBDEVFS_DISCARDURB`; this should be an internal change
+to `android_usbfs.cpp` without changing the app/UHD context boundary.

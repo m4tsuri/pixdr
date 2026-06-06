@@ -4,8 +4,7 @@
 	branch = pixdr-android-uhd-4.10
 [submodule "external/libusb"]
 	path = external/libusb
-	url = https://github.com/m4tsuri/libusb.git
-	branch = pixdr-android
+	url = https://github.com/libusb/libusb.git
 [submodule "external/uhd-rs"]
 	path = external/uhd-rs
 	url = https://github.com/m4tsuri/uhd-rust.git

@@ -17,10 +17,10 @@ Use the scripts in the repository root:
 
 ## External dependencies
 
-`external/` contains forked dependency repos. In a public release these should be git submodules:
+`external/` contains dependency repos as git submodules:
 
 - `external/uhd` -> `m4tsuri/uhd`, branch `pixdr-android-uhd-4.10`
-- `external/libusb` -> `m4tsuri/libusb`, branch `pixdr-android`
+- `external/libusb` -> upstream `libusb/libusb`, tag `v1.0.27` (unpatched)
 - `external/uhd-rs` -> `m4tsuri/uhd-rust`, branch `pixdr-android`
 - `external/boost-android` -> `m4tsuri/Boost-for-Android`, branch `pixdr-android`
 
@@ -32,7 +32,7 @@ Generated/local-heavy files go under `build/` and are ignored by `.gitignore`:
 - `build/native/uhd-android/`
 - `build/native/sources/`
 
-`patches/` contains `git format-patch` exports for review/auditing.
+`patches/` contains `git format-patch` exports for patched forks. There is no libusb patch; Android fd compatibility is implemented in UHD's native usbfs transport.
 
 ## Build order
 

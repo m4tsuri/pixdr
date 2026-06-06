@@ -15,9 +15,9 @@ Current target setup:
 ```text
 pixdr/
   app/                    Rust NativeActivity app, AndroidManifest, assets, resources
-  external/               Forked external dependencies (git submodules in release)
+  external/               External dependencies (git submodules in release)
     uhd/                  m4tsuri/uhd, branch pixdr-android-uhd-4.10
-    libusb/               m4tsuri/libusb, branch pixdr-android
+    libusb/               upstream libusb, tag v1.0.27
     uhd-rs/               m4tsuri/uhd-rust, branch pixdr-android
     boost-android/        m4tsuri/Boost-for-Android, branch pixdr-android
   build/                  Generated native build/toolchain workspace (ignored)
@@ -30,7 +30,7 @@ Important app files:
 
 - `app/src/lib.rs` — egui UI, B210 worker, FFT/waterfall display
 - `app/src/usb.rs` — Android USB permission and `UsbDeviceConnection` fd acquisition via JNI
-- `app/src/uhd_wrapper.rs` — UHD init/open with Android fd/usbfs path globals
+- `app/src/uhd_wrapper.rs` — UHD init/open using injected Android USB context
 - `app/AndroidManifest.xml` — NativeActivity declaration
 
 ## Prerequisites
@@ -80,7 +80,7 @@ This builds Boost, libusb, and UHD into `build/native/toolchain/arm64-v8a`:
 scripts/build-native.sh
 ```
 
-This step is slow and assumes `external/` has been initialized with the pixdr fork branches.
+This step is slow and assumes `external/` has been initialized with the pixdr fork branches plus upstream libusb.
 
 ### 2. Fetch B200/B210 runtime images
 
@@ -123,7 +123,7 @@ If native dependency build directories already exist:
 scripts/rebuild-all.sh
 ```
 
-This rebuilds patched libusb/UHD, builds the Rust app, packages the APK, installs it, and starts the app.
+This rebuilds native dependencies/UHD, builds the Rust app, packages the APK, installs it, and starts the app.
 
 ## Environment overrides
 
@@ -158,11 +158,14 @@ If the UI says `B210 opened; RX stream failed`, UHD opened the device but RX str
 
 ## Fork branches
 
-External dependencies are maintained as fork branches:
+Patched dependencies are maintained as fork branches:
 
 - `https://github.com/m4tsuri/uhd`, branch `pixdr-android-uhd-4.10`
-- `https://github.com/m4tsuri/libusb`, branch `pixdr-android`
 - `https://github.com/m4tsuri/uhd-rust`, branch `pixdr-android`
 - `https://github.com/m4tsuri/Boost-for-Android`, branch `pixdr-android`
+
+Unpatched dependency:
+
+- `https://github.com/libusb/libusb`, tag `v1.0.27`
 
 `patches/` contains `git format-patch` exports for review/auditing.

@@ -4,10 +4,10 @@ source "$(cd "$(dirname "$0")" && pwd)/env.sh"
 
 mkdir -p \
   "${PIXDR_ROOT}/patches/uhd" \
-  "${PIXDR_ROOT}/patches/libusb" \
   "${PIXDR_ROOT}/patches/uhd-rs" \
   "${PIXDR_ROOT}/patches/boost-android"
 
+rm -rf "${PIXDR_ROOT}/patches/libusb"
 rm -f "${PIXDR_ROOT}"/patches/*/*.patch
 
 export_series() {
@@ -15,6 +15,7 @@ export_series() {
   local base="$2"
   local out_dir="$3"
 
+  mkdir -p "${out_dir}"
   if git -C "${repo}" rev-parse --verify "${base}" >/dev/null 2>&1; then
     git -C "${repo}" format-patch -o "${out_dir}" "${base}..HEAD" >/dev/null
   else
@@ -25,8 +26,6 @@ export_series() {
 
 export_series "${PIXDR_UHD_SRC}" "${PIXDR_UHD_PATCH_BASE:-v4.10.0.0}" \
   "${PIXDR_ROOT}/patches/uhd"
-export_series "${PIXDR_LIBUSB_SRC}" "${PIXDR_LIBUSB_PATCH_BASE:-v1.0.27}" \
-  "${PIXDR_ROOT}/patches/libusb"
 export_series "${PIXDR_UHDRS_SRC}" "${PIXDR_UHDRS_PATCH_BASE:-origin/master}" \
   "${PIXDR_ROOT}/patches/uhd-rs"
 export_series "${PIXDR_BOOST_ANDROID_SRC}" "${PIXDR_BOOST_ANDROID_PATCH_BASE:-HEAD^}" \

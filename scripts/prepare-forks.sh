@@ -2,8 +2,8 @@
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/env.sh"
 
-# Commit and push external fork branches. This is useful after editing external/*.
-# Requires GitHub CLI authentication.
+# Commit and push patched external fork branches. libusb is intentionally
+# unpatched and is not handled by this script.
 
 pixdr_require_cmd git gh >/dev/null
 
@@ -33,14 +33,8 @@ prepare_push() {
 prepare_push \
   "UHD" "${PIXDR_UHD_SRC}" "EttusResearch/uhd" "uhd" \
   "${PIXDR_UHD_BRANCH:-pixdr-android-uhd-4.10}" \
-  "pixdr: add Android USB fd support for B200" \
-  "host/include/uhd/transport/usb_device_handle.hpp host/lib/transport/libusb1_base.cpp host/lib/transport/libusb1_base.hpp host/lib/transport/libusb1_control.cpp host/lib/usrp/b200/b200_iface.cpp host/lib/usrp/b200/b200_impl.cpp host/lib/utils/pathslib.cpp host/lib/utils/platform.cpp"
-
-prepare_push \
-  "libusb" "${PIXDR_LIBUSB_SRC}" "libusb/libusb" "libusb" \
-  "${PIXDR_LIBUSB_BRANCH:-pixdr-android}" \
-  "pixdr: support Android wrapped usbfs fd diagnostics" \
-  "libusb/core.c libusb/os/linux_usbfs.c"
+  "pixdr: add Android USB context and native usbfs transport" \
+  "host/include/uhd/transport/android_usb_context.hpp host/include/uhd/transport/usb_device_handle.hpp host/lib/transport/android_usb_context.cpp host/lib/transport/android_usbfs.cpp host/lib/transport/android_usbfs.hpp host/lib/transport/CMakeLists.txt host/lib/transport/libusb1_base.cpp host/lib/transport/libusb1_base.hpp host/lib/transport/libusb1_control.cpp host/lib/transport/libusb1_zero_copy.cpp host/lib/usrp/b200/b200_iface.cpp host/lib/usrp/b200/b200_impl.cpp host/lib/utils/pathslib.cpp host/lib/utils/platform.cpp"
 
 prepare_push \
   "uhd-rs" "${PIXDR_UHDRS_SRC}" "samcrow/uhd-rust" "uhd-rust" \
