@@ -21,7 +21,7 @@ pixdr/
     uhd-rs/               m4tsuri/uhd-rust, branch pixdr-android
     boost-android/        m4tsuri/Boost-for-Android, branch pixdr-android
   build/                  Generated native build/toolchain workspace (ignored)
-  docs/                   Project notes
+  docs/                   Project notes and architecture notes
   patches/                format-patch exports of fork changes
   scripts/                Supported build/install/log entrypoints
 ```
@@ -151,6 +151,10 @@ Expected successful flow:
 7. UI shows live FFT/waterfall when RX streamer is active.
 
 If the UI says `B210 opened; RX stream failed`, UHD opened the device but RX streamer setup failed. Replugging or restarting the app is often enough while this Android USB path is still being hardened.
+
+## Architecture notes
+
+- Android USB context injection into UHD: `docs/android-uhd-injection.md`
 
 ## Fork branches
 

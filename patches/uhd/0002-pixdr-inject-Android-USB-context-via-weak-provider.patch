@@ -1,0 +1,325 @@
+From 3fff8b3d53ef659cfcb798161f0d92e1edb687ac Mon Sep 17 00:00:00 2001
+From: M4tsuri <me@m4tsuri.com>
+Date: Sat, 6 Jun 2026 15:15:07 +0800
+Subject: [PATCH 2/2] pixdr: inject Android USB context via weak provider
+
+---
+ .../uhd/transport/android_usb_context.hpp     | 35 +++++++++++++++++
+ host/lib/transport/CMakeLists.txt             |  1 +
+ host/lib/transport/android_usb_context.cpp    | 39 +++++++++++++++++++
+ host/lib/transport/libusb1_base.cpp           | 26 ++++++-------
+ host/lib/transport/libusb1_control.cpp        |  7 ++--
+ host/lib/usrp/b200/b200_impl.cpp              | 28 ++++++-------
+ 6 files changed, 100 insertions(+), 36 deletions(-)
+ create mode 100644 host/include/uhd/transport/android_usb_context.hpp
+ create mode 100644 host/lib/transport/android_usb_context.cpp
+
+diff --git a/host/include/uhd/transport/android_usb_context.hpp b/host/include/uhd/transport/android_usb_context.hpp
+new file mode 100644
+index 0000000..ec90cfb
+--- /dev/null
++++ b/host/include/uhd/transport/android_usb_context.hpp
+@@ -0,0 +1,35 @@
++//
++// Copyright 2026 pixdr contributors
++//
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++
++#pragma once
++
++#include <cstdint>
++#include <string>
++
++namespace uhd { namespace transport {
++
++// Optional Android USB host context supplied by an embedding application.
++//
++// Android applications cannot enumerate /dev/bus/usb directly under normal
++// SELinux policy. The app owns an already-authorized UsbDeviceConnection and
++// injects its file descriptor here. Desktop builds simply do not provide a
++// context and UHD continues to use normal libusb enumeration.
++class android_usb_context
++{
++public:
++    virtual ~android_usb_context() = default;
++
++    virtual intptr_t fd() const = 0;
++    virtual std::string usbfs_path() const = 0;
++    virtual uint16_t vid() const = 0;
++    virtual uint16_t pid() const = 0;
++    virtual bool firmware_loaded() const = 0;
++};
++
++// Returns nullptr when no Android USB context is available or fd() < 0.
++const android_usb_context* get_android_usb_context();
++
++}} // namespace uhd::transport
+diff --git a/host/lib/transport/CMakeLists.txt b/host/lib/transport/CMakeLists.txt
+index 396314a..539c085 100644
+--- a/host/lib/transport/CMakeLists.txt
++++ b/host/lib/transport/CMakeLists.txt
+@@ -25,6 +25,7 @@ if(ENABLE_USB)
+     include_directories(${LIBUSB_INCLUDE_DIRS})
+     LIBUHD_APPEND_LIBS(${LIBUSB_LIBRARIES})
+     LIBUHD_APPEND_SOURCES(
++        ${CMAKE_CURRENT_SOURCE_DIR}/android_usb_context.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/libusb1_control.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/libusb1_zero_copy.cpp
+         ${CMAKE_CURRENT_SOURCE_DIR}/libusb1_base.cpp
+diff --git a/host/lib/transport/android_usb_context.cpp b/host/lib/transport/android_usb_context.cpp
+new file mode 100644
+index 0000000..dc9695f
+--- /dev/null
++++ b/host/lib/transport/android_usb_context.cpp
+@@ -0,0 +1,39 @@
++//
++// Copyright 2026 pixdr contributors
++//
++// SPDX-License-Identifier: GPL-3.0-or-later
++//
++
++#include <uhd/transport/android_usb_context.hpp>
++#include <dlfcn.h>
++
++using uhd::transport::android_usb_context;
++
++extern "C" __attribute__((weak)) const android_usb_context* pixdr_uhd_android_usb_context();
++
++namespace uhd { namespace transport {
++
++const android_usb_context* get_android_usb_context()
++{
++    using provider_t = const android_usb_context* (*)();
++
++    provider_t provider = nullptr;
++    if (pixdr_uhd_android_usb_context) {
++        provider = pixdr_uhd_android_usb_context;
++    } else {
++        provider = reinterpret_cast<provider_t>(
++            dlsym(RTLD_DEFAULT, "pixdr_uhd_android_usb_context"));
++    }
++
++    if (!provider) {
++        return nullptr;
++    }
++
++    const android_usb_context* ctx = provider();
++    if (!ctx || ctx->fd() < 0) {
++        return nullptr;
++    }
++    return ctx;
++}
++
++}} // namespace uhd::transport
+diff --git a/host/lib/transport/libusb1_base.cpp b/host/lib/transport/libusb1_base.cpp
+index 76f5f7c..71e1d39 100644
+--- a/host/lib/transport/libusb1_base.cpp
++++ b/host/lib/transport/libusb1_base.cpp
+@@ -10,6 +10,7 @@
+ #include <uhd/exception.hpp>
+ #include <uhd/types/dict.hpp>
+ #include <uhd/types/serial.hpp>
++#include <uhd/transport/android_usb_context.hpp>
+ #include <uhd/utils/log.hpp>
+ #include <uhd/utils/tasks.hpp>
+ #include <cstdlib>
+@@ -25,13 +26,6 @@
+ using namespace uhd;
+ using namespace uhd::transport;
+ 
+-// Android: when set >= 0, libusb_open() is replaced with libusb_wrap_sys_device()
+-// and device enumeration returns a dummy B210 entry.
+-extern "C" __attribute__((visibility("default"))) intptr_t g_android_usb_fd = -1;
+-extern "C" __attribute__((visibility("default"))) const char* g_android_usb_path = nullptr;
+-extern "C" __attribute__((visibility("default"))) uint16_t g_android_usb_vid = 0;
+-extern "C" __attribute__((visibility("default"))) uint16_t g_android_usb_pid = 0;
+-extern "C" __attribute__((visibility("default"))) bool g_android_usb_fw_loaded = false;
+ // Keep a strong reference to the libusb session alive throughout the process
+ // to prevent libusb_exit/libusb_init cycling which corrupts internal state.
+ static libusb::session::sptr g_android_session;
+@@ -49,7 +43,7 @@ class libusb_session_impl : public libusb::session
+ public:
+     libusb_session_impl(void)
+     {
+-        if (g_android_usb_fd >= 0) {
++        if (get_android_usb_context()) {
+             libusb_set_option(NULL, LIBUSB_OPTION_NO_DEVICE_DISCOVERY);
+         }
+         UHD_ASSERT_THROW(libusb_init(&_context) == 0);
+@@ -190,7 +184,7 @@ class libusb_device_list_impl : public libusb::device_list
+ public:
+     libusb_device_list_impl(void)
+     {
+-        if (g_android_usb_fd >= 0) {
++        if (get_android_usb_context()) {
+             g_android_session = libusb::session::get_global_session();
+             return;
+         }
+@@ -322,16 +316,16 @@ public:
+     libusb_device_handle_impl(libusb::device::sptr dev)
+     {
+         _dev = dev;
+-        if (g_android_usb_fd >= 0) {
++        if (const android_usb_context* ctx = get_android_usb_context()) {
+             g_android_session = libusb::session::get_global_session();
+             int ret = libusb_wrap_sys_device(
+-                g_android_session->get_context(),
+-                g_android_usb_fd, &_handle);
++                g_android_session->get_context(), ctx->fd(), &_handle);
+             if (ret != 0) {
+                 throw uhd::os_error(
+                     std::string("libusb_wrap_sys_device failed: ") +
+                     libusb_error_name(ret));
+             }
++            _wrapped_android_fd = true;
+         } else {
+             UHD_ASSERT_THROW(libusb_open(_dev->get(), &_handle) == 0);
+         }
+@@ -353,6 +347,7 @@ public:
+         int ret = libusb_wrap_sys_device(
+             g_android_session->get_context(),
+             fd, &_handle);
++        _wrapped_android_fd = true;
+         if (ret != 0) {
+             throw uhd::os_error(
+                 std::string("libusb_wrap_sys_device failed: ") +
+@@ -400,7 +395,8 @@ public:
+ 
+ private:
+     libusb::device::sptr _dev; // always keep a reference to device
+-    libusb_device_handle* _handle;
++    libusb_device_handle* _handle = nullptr;
++    bool _wrapped_android_fd = false;
+     std::vector<int> _claimed;
+ };
+ 
+@@ -410,10 +406,10 @@ libusb_device_handle_impl::~libusb_device_handle_impl(void)
+     for (size_t i = 0; i < _claimed.size(); i++) {
+         libusb_release_interface(this->get(), _claimed[i]);
+     }
+-    if (g_android_usb_fd >= 0) {
++    if (_wrapped_android_fd) {
+         // Android: don't call libusb_close — it frees the dummy device
+         // allocated by our wrap_sys_device patch, triggering invalid free
+-        // with hardened_malloc. The fd is closed when the process exits.
++        // with hardened_malloc. The fd is owned by Android's UsbDeviceConnection.
+         _handle = nullptr;
+     } else {
+         libusb_close(_handle);
+diff --git a/host/lib/transport/libusb1_control.cpp b/host/lib/transport/libusb1_control.cpp
+index bcfb6ec..bbd0040 100644
+--- a/host/lib/transport/libusb1_control.cpp
++++ b/host/lib/transport/libusb1_control.cpp
+@@ -6,13 +6,12 @@
+ //
+ 
+ #include "libusb1_base.hpp"
++#include <uhd/transport/android_usb_context.hpp>
+ #include <uhd/transport/usb_control.hpp>
+ #include <mutex>
+ 
+ using namespace uhd::transport;
+ 
+-extern "C" intptr_t g_android_usb_fd;
+-
+ usb_control::~usb_control(void)
+ {
+     /* NOP */
+@@ -66,9 +65,9 @@ libusb_control_impl::~libusb_control_impl(void)
+  **********************************************************************/
+ usb_control::sptr usb_control::make(usb_device_handle::sptr handle, const int interface)
+ {
+-    if (g_android_usb_fd >= 0) {
++    if (const android_usb_context* ctx = get_android_usb_context()) {
+         return sptr(new libusb_control_impl(
+-            libusb::device_handle::make_from_fd(g_android_usb_fd), interface));
++            libusb::device_handle::make_from_fd(ctx->fd()), interface));
+     }
+     return sptr(new libusb_control_impl(
+         libusb::device_handle::get_cached_handle(
+diff --git a/host/lib/usrp/b200/b200_impl.cpp b/host/lib/usrp/b200/b200_impl.cpp
+index b8d4b27..487c5a4 100644
+--- a/host/lib/usrp/b200/b200_impl.cpp
++++ b/host/lib/usrp/b200/b200_impl.cpp
+@@ -11,6 +11,7 @@
+ #include <uhd/cal/database.hpp>
+ #include <uhd/config.hpp>
+ #include <uhd/exception.hpp>
++#include <uhd/transport/android_usb_context.hpp>
+ #include <uhd/transport/usb_control.hpp>
+ #include <uhd/types/metadata.hpp>
+ #include <uhd/usrp/dboard_eeprom.hpp>
+@@ -35,12 +36,6 @@ using namespace uhd::usrp;
+ using namespace uhd::usrp::gpio_atr;
+ using namespace uhd::transport;
+ 
+-extern "C" intptr_t g_android_usb_fd;
+-extern "C" const char* g_android_usb_path;
+-extern "C" uint16_t g_android_usb_vid;
+-extern "C" uint16_t g_android_usb_pid;
+-extern "C" bool g_android_usb_fw_loaded;
+-
+ namespace {
+ constexpr int64_t REENUMERATION_TIMEOUT_MS = 3000;
+ }
+@@ -179,12 +174,11 @@ std::vector<usb_device_handle::sptr> get_b200_device_handles(const device_addr_t
+     }
+ 
+     // find the usrps and load firmware
+-    if (g_android_usb_fd >= 0) {
+-        uint16_t android_vid = g_android_usb_vid ? g_android_usb_vid : B200_VENDOR_ID;
+-        uint16_t android_pid = g_android_usb_pid ? g_android_usb_pid : B200_PRODUCT_ID;
++    if (const android_usb_context* ctx = get_android_usb_context()) {
++        uint16_t android_vid = ctx->vid() ? ctx->vid() : B200_VENDOR_ID;
++        uint16_t android_pid = ctx->pid() ? ctx->pid() : B200_PRODUCT_ID;
+         return usb_device_handle::get_device_list(
+-            android_vid, android_pid, (int)g_android_usb_fd,
+-            g_android_usb_path ? std::string(g_android_usb_path) : std::string());
++            android_vid, android_pid, (int)ctx->fd(), ctx->usbfs_path());
+     }
+     return usb_device_handle::get_device_list(vid_pid_pair_list);
+ }
+@@ -211,7 +205,8 @@ static device_addrs_t b200_find(const device_addr_t& hint)
+             return b200_addrs;
+     }
+ 
+-    if (g_android_usb_fd >= 0 && g_android_usb_fw_loaded) {
++    const android_usb_context* android_ctx = get_android_usb_context();
++    if (android_ctx && android_ctx->firmware_loaded()) {
+         device_addr_t new_addr;
+         new_addr["type"]    = "b200";
+         new_addr["name"]    = "B200";
+@@ -249,7 +244,7 @@ static device_addrs_t b200_find(const device_addr_t& hint)
+         // check if fw was already loaded
+         if (!(handle->firmware_loaded())) {
+             b200_iface::make(control)->load_firmware(b200_fw_image);
+-            if (g_android_usb_fd >= 0) {
++            if (get_android_usb_context()) {
+                 UHD_LOGGER_INFO("B200") << "Android fd firmware load submitted; returning to app for USB re-enumeration";
+                 return b200_addrs;
+             }
+@@ -403,17 +398,16 @@ b200_impl::b200_impl(
+ 
+     std::vector<usb_device_handle::sptr> device_list;
+ 
+-    if (g_android_usb_fd >= 0) {
++    if (const android_usb_context* ctx = get_android_usb_context()) {
+         // Android: use fd+path to create device handle (bypasses libusb enum)
+         device_list = usb_device_handle::get_device_list(
+-            vid, pid, (int)g_android_usb_fd,
+-            g_android_usb_path ? std::string(g_android_usb_path) : std::string());
++            vid, pid, (int)ctx->fd(), ctx->usbfs_path());
+     } else {
+         device_list = usb_device_handle::get_device_list(vid_pid_pair_list);
+     }
+ 
+     // locate the matching handle in the device list
+-    if (g_android_usb_fd >= 0 && !device_list.empty() && !device_addr.has_key("serial")) {
++    if (get_android_usb_context() && !device_list.empty() && !device_addr.has_key("serial")) {
+         handle = device_list.front();
+     } else {
+         for (usb_device_handle::sptr dev_handle : device_list) {
+-- 
+2.54.0
+

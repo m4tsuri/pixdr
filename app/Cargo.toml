@@ -16,6 +16,10 @@ uhd = { path = "../external/uhd-rs/uhd" }
 anyhow = "1"
 num-complex = "0.4"
 rustfft = "6"
+cxx = "1"
+
+[build-dependencies]
+cxx-build = "1"
 
 [target.'cfg(target_os = "android")'.dependencies.eframe]
 version = "0.34"

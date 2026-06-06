@@ -10,17 +10,27 @@ mkdir -p \
 
 rm -f "${PIXDR_ROOT}"/patches/*/*.patch
 
-git -C "${PIXDR_UHD_SRC}" format-patch -1 HEAD --stdout \
-  > "${PIXDR_ROOT}/patches/uhd/0001-pixdr-add-android-usb-fd-support-for-b200.patch"
+export_series() {
+  local repo="$1"
+  local base="$2"
+  local out_dir="$3"
 
-git -C "${PIXDR_LIBUSB_SRC}" format-patch -1 HEAD --stdout \
-  > "${PIXDR_ROOT}/patches/libusb/0001-pixdr-support-android-wrapped-usbfs-fd-diagnostics.patch"
+  if git -C "${repo}" rev-parse --verify "${base}" >/dev/null 2>&1; then
+    git -C "${repo}" format-patch -o "${out_dir}" "${base}..HEAD" >/dev/null
+  else
+    echo "WARNING: base '${base}' not found for ${repo}; exporting HEAD only" >&2
+    git -C "${repo}" format-patch -1 HEAD -o "${out_dir}" >/dev/null
+  fi
+}
 
-git -C "${PIXDR_UHDRS_SRC}" format-patch -1 HEAD --stdout \
-  > "${PIXDR_ROOT}/patches/uhd-rs/0001-pixdr-support-android-uhd-cross-build.patch"
-
-git -C "${PIXDR_BOOST_ANDROID_SRC}" format-patch -1 HEAD --stdout \
-  > "${PIXDR_ROOT}/patches/boost-android/0001-pixdr-make-android-boost-build-non-interactive.patch"
+export_series "${PIXDR_UHD_SRC}" "${PIXDR_UHD_PATCH_BASE:-v4.10.0.0}" \
+  "${PIXDR_ROOT}/patches/uhd"
+export_series "${PIXDR_LIBUSB_SRC}" "${PIXDR_LIBUSB_PATCH_BASE:-v1.0.27}" \
+  "${PIXDR_ROOT}/patches/libusb"
+export_series "${PIXDR_UHDRS_SRC}" "${PIXDR_UHDRS_PATCH_BASE:-origin/master}" \
+  "${PIXDR_ROOT}/patches/uhd-rs"
+export_series "${PIXDR_BOOST_ANDROID_SRC}" "${PIXDR_BOOST_ANDROID_PATCH_BASE:-HEAD^}" \
+  "${PIXDR_ROOT}/patches/boost-android"
 
 if grep -R "${HOME}\|${PIXDR_ROOT}" "${PIXDR_ROOT}/patches" >/dev/null 2>&1; then
   echo "WARNING: local absolute path found in patches; inspect before publishing:" >&2

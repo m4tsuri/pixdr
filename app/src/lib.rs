@@ -12,6 +12,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod android_uhd_context;
 mod usb;
 mod uhd_wrapper;
 
