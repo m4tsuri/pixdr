@@ -104,13 +104,14 @@ where
         _mo: &mut MessageOutputs,
         _meta: &mut BlockMeta,
     ) -> Result<()> {
-        let needs_reconfig = self
+        let (needs_reconfig, user_paused, user_stopped) = self
             .shared
             .lock()
-            .map(|s| s.config_revision != s.applied_revision)
-            .unwrap_or(false);
-        if needs_reconfig {
-            info!("FutureSDR UHD source stopping for retune");
+            .map(|s| (s.config_revision != s.applied_revision, s.user_paused, s.user_stopped))
+            .unwrap_or((false, false, false));
+        if needs_reconfig || user_paused || user_stopped {
+            let reason = if user_stopped { "stop" } else if user_paused { "pause" } else { "retune" };
+            info!("FutureSDR UHD source stopping for {reason}");
             if let Some(streamer) = self.streamer.as_mut() {
                 let _ = streamer.send_command(&uhd::StreamCommand {
                     time: uhd::StreamTime::Now,
@@ -119,7 +120,14 @@ where
             }
             update_state(&self.shared, |s| {
                 s.streaming = false;
-                s.status = "Retuning".to_string();
+                s.status = if user_stopped {
+                    "Stopping"
+                } else if user_paused {
+                    "Paused"
+                } else {
+                    "Retuning"
+                }
+                .to_string();
             });
             io.finished = true;
             return Ok(());

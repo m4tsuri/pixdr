@@ -42,6 +42,8 @@ struct SdrUiState {
     applied_revision: u64,
     opened: bool,
     streaming: bool,
+    user_paused: bool,
+    user_stopped: bool,
     fft_size: usize,
     fft_fps: f32,
     fft_smoothing: f32,
@@ -68,6 +70,8 @@ impl Default for SdrUiState {
             applied_revision: 0,
             opened: false,
             streaming: false,
+            user_paused: false,
+            user_stopped: false,
             fft_size: DEFAULT_FFT_SIZE,
             fft_fps: 15.0,
             fft_smoothing: 0.65,
@@ -162,20 +166,51 @@ fn start_sdr_worker(app: winit::platform::android::activity::AndroidApp, shared:
         let vm = app.vm_as_ptr();
         let activity = app.activity_as_ptr();
 
+        if shared.lock().map(|s| s.user_stopped).unwrap_or(false) {
+            thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+
         match try_open_b210_once(vm, activity, &shared) {
             Some(usrp) => {
                 let usrp = Arc::new(Mutex::new(usrp));
                 loop {
-                    if let Err(e) = futuresdr_backend::run_b210_flowgraph(usrp.clone(), shared.clone()) {
-                        error!("FutureSDR graph stopped: {e:?}");
+                    if shared.lock().map(|s| s.user_stopped).unwrap_or(false) {
+                        drop(usrp);
+                        usb::close_current_usb_connection(vm);
                         update_state(&shared, |s| {
-                            s.status = "B210 opened; RX stream failed".to_string();
-                            s.detail = format!("No live samples: {e}");
                             s.streaming = false;
-                            // Keep the last spectrum/waterfall frame visible. Retunes and transient
-                            // stream setup failures should look frozen, not like a hard reset.
+                            s.opened = false;
+                            s.status = "Stopped".to_string();
+                            s.detail = "RX stopped; UHD handle and Android USB connection closed".to_string();
                         });
-                        thread::sleep(Duration::from_secs(1));
+                        break;
+                    }
+                    if shared.lock().map(|s| s.user_paused).unwrap_or(false) {
+                        update_state(&shared, |s| {
+                            s.streaming = false;
+                            s.status = "Paused".to_string();
+                        });
+                        thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+                    match futuresdr_backend::run_b210_flowgraph(usrp.clone(), shared.clone()) {
+                        Ok(()) => {
+                            if shared.lock().map(|s| s.user_stopped).unwrap_or(false) {
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            error!("FutureSDR graph stopped: {e:?}");
+                            update_state(&shared, |s| {
+                                s.status = "B210 opened; RX stream failed".to_string();
+                                s.detail = format!("No live samples: {e}");
+                                s.streaming = false;
+                                // Keep the last spectrum/waterfall frame visible. Retunes and transient
+                                // stream setup failures should look frozen, not like a hard reset.
+                            });
+                            thread::sleep(Duration::from_secs(1));
+                        }
                     }
                 }
             }
@@ -230,15 +265,22 @@ fn apply_rx_config(usrp: &mut uhd::Usrp, shared: &SharedState) -> anyhow::Result
         .context("set_rx_gain failed")?;
 
     update_state(shared, |s| {
-        s.sample_rate = sample_rate;
-        s.applied_revision = revision;
-        s.status = if s.streaming { "Streaming" } else { "B210 opened" }.to_string();
-        s.detail = format!(
-            "RX tuned: {:.6} MHz / {:.3} MHz BW / {:.3} MS/s",
-            center_hz / 1e6,
-            bandwidth_hz / 1e6,
-            sample_rate / 1e6
-        );
+        if s.config_revision == revision {
+            // Only acknowledge the config if the UI has not moved on while UHD
+            // was applying it. Otherwise, do not write this stale snapshot back
+            // into state; the FutureSDR source will immediately stop and the
+            // next graph will apply the newest revision.
+            s.bandwidth_hz = bandwidth_hz;
+            s.sample_rate = sample_rate;
+            s.applied_revision = revision;
+            s.status = if s.streaming { "Streaming" } else { "B210 opened" }.to_string();
+            s.detail = format!(
+                "RX tuned: {:.6} MHz / {:.3} MHz BW / {:.3} MS/s",
+                center_hz / 1e6,
+                bandwidth_hz / 1e6,
+                sample_rate / 1e6
+            );
+        }
     });
 
     Ok(())
@@ -398,7 +440,7 @@ impl eframe::App for PixdrApp {
             )
             .show_inside(ui, |ui| {
                 ui.set_clip_rect(ui.max_rect());
-                draw_header(ui, &state);
+                draw_header(ui, &self.shared, &state);
                 ui.add_space(4.0);
                 draw_tabs(ui, &mut self.active_tab);
                 ui.add_space(4.0);
@@ -429,18 +471,73 @@ impl eframe::App for PixdrApp {
     }
 }
 
-fn draw_header(ui: &mut egui::Ui, state: &SdrUiState) {
+fn draw_header(ui: &mut egui::Ui, shared: &SharedState, state: &SdrUiState) {
     ui.horizontal(|ui| {
         ui.heading("pixdr");
         ui.separator();
         let color = if state.streaming {
             egui::Color32::LIGHT_GREEN
-        } else if state.opened {
+        } else if state.user_paused || state.opened {
             egui::Color32::YELLOW
         } else {
             egui::Color32::LIGHT_RED
         };
-        ui.colored_label(color, &state.status);
+        if state.streaming || state.user_paused {
+            let status = ui
+                .add(
+                    egui::Label::new(egui::RichText::new(&state.status).color(color))
+                        .sense(egui::Sense::click()),
+                )
+                .on_hover_text(if state.streaming { "Tap to pause RX" } else { "Tap to resume RX" });
+            if status.clicked() {
+                let pause = state.streaming;
+                update_state(shared, |s| {
+                    s.user_paused = pause;
+                    s.streaming = false;
+                    s.status = if pause { "Paused" } else { "Resuming" }.to_string();
+                    s.detail = if pause {
+                        "RX paused by user".to_string()
+                    } else {
+                        "Restarting FutureSDR UHD source".to_string()
+                    };
+                });
+            }
+        } else {
+            ui.colored_label(color, &state.status);
+        }
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if state.user_stopped {
+                if ui
+                    .button("Start")
+                    .on_hover_text("Re-open USB/UHD and start RX")
+                    .clicked()
+                {
+                    update_state(shared, |s| {
+                        s.user_stopped = false;
+                        s.user_paused = false;
+                        s.streaming = false;
+                        s.status = "Starting".to_string();
+                        s.detail = "Scanning USB and opening B210".to_string();
+                    });
+                }
+            } else {
+                let can_stop = state.opened || state.streaming || state.user_paused;
+                if ui
+                    .add_enabled(can_stop, egui::Button::new("Stop"))
+                    .on_hover_text("Stop RX, drop UHD handle, and close Android USB connection")
+                    .clicked()
+                {
+                    update_state(shared, |s| {
+                        s.user_stopped = true;
+                        s.user_paused = false;
+                        s.streaming = false;
+                        s.status = "Stopping".to_string();
+                        s.detail = "Stopping UHD stream and releasing USB device".to_string();
+                    });
+                }
+            }
+        });
     });
 }
 
@@ -977,12 +1074,13 @@ fn draw_spectrum(
     if state.frames > 0 {
         let min_db = -120.0;
         let max_db = 0.0;
-        let points: Vec<egui::Pos2> = state
-            .spectrum_db
+        let (start, end) = visible_spectrum_bins(state);
+        let visible = &state.spectrum_db[start..end];
+        let points: Vec<egui::Pos2> = visible
             .iter()
             .enumerate()
             .map(|(i, db)| {
-                let x = rect.left() + rect.width() * i as f32 / (state.spectrum_db.len().saturating_sub(1).max(1)) as f32;
+                let x = rect.left() + rect.width() * i as f32 / (visible.len().saturating_sub(1).max(1)) as f32;
                 let t = ((*db - min_db) / (max_db - min_db)).clamp(0.0, 1.0);
                 let y = rect.bottom() - rect.height() * t;
                 egui::pos2(x, y)
@@ -1005,14 +1103,14 @@ fn draw_spectrum(
     painter.text(
         rect.left_bottom() + egui::vec2(8.0, -8.0),
         egui::Align2::LEFT_BOTTOM,
-        format!("{:.6} MHz", (state.center_hz - state.sample_rate / 2.0) / 1e6),
+        format!("{:.6} MHz", (state.center_hz - state.bandwidth_hz / 2.0) / 1e6),
         egui::FontId::proportional(13.0),
         egui::Color32::GRAY,
     );
     painter.text(
         rect.right_bottom() + egui::vec2(-8.0, -8.0),
         egui::Align2::RIGHT_BOTTOM,
-        format!("{:.6} MHz", (state.center_hz + state.sample_rate / 2.0) / 1e6),
+        format!("{:.6} MHz", (state.center_hz + state.bandwidth_hz / 2.0) / 1e6),
         egui::FontId::proportional(13.0),
         egui::Color32::GRAY,
     );
@@ -1027,7 +1125,7 @@ fn handle_spectrum_gestures(
     spectrum_pinch_active: &mut bool,
     spectrum_last_commit: &mut Option<Instant>,
 ) {
-    let span_hz = state.sample_rate.max(1.0);
+    let span_hz = state.bandwidth_hz.max(1.0);
     let mut handled_pinch = false;
     let mut gesture_changed = false;
 
@@ -1127,6 +1225,14 @@ fn draw_grid(painter: &egui::Painter, rect: egui::Rect) {
     }
 }
 
+fn visible_spectrum_bins(state: &SdrUiState) -> (usize, usize) {
+    let n = state.spectrum_db.len().max(1);
+    let ratio = (state.bandwidth_hz / state.sample_rate.max(1.0)).clamp(0.0, 1.0);
+    let visible = ((n as f64 * ratio).round() as usize).clamp(2, n);
+    let start = (n - visible) / 2;
+    (start, start + visible)
+}
+
 fn draw_constellation(ui: &mut egui::Ui, state: &SdrUiState) {
     let desired = egui::vec2(ui.available_width(), (ui.available_height() - 34.0).clamp(360.0, 760.0));
     let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
@@ -1210,9 +1316,11 @@ fn draw_waterfall(ui: &mut egui::Ui, state: &SdrUiState) {
     painter.rect_filled(rect, 4.0, egui::Color32::BLACK);
 
     let rows = state.waterfall.len().max(1);
+    let (visible_start, visible_end) = visible_spectrum_bins(state);
+    let visible_len = visible_end.saturating_sub(visible_start).max(1);
     let bins = ((rect.width() / 3.0).round() as usize)
         .clamp(160, 768)
-        .min(state.spectrum_db.len().max(1));
+        .min(visible_len);
     let row_h = rect.height() / WATERFALL_ROWS as f32;
     let bin_w = rect.width() / bins as f32;
 
@@ -1222,9 +1330,15 @@ fn draw_waterfall(ui: &mut egui::Ui, state: &SdrUiState) {
             if y0 < rect.top() {
                 break;
             }
+            if spectrum.is_empty() {
+                continue;
+            }
+            let row_start = visible_start.min(spectrum.len().saturating_sub(1));
+            let row_end = visible_end.min(spectrum.len()).max(row_start + 1);
+            let visible = &spectrum[row_start..row_end];
             for b in 0..bins {
-                let idx = b * spectrum.len() / bins;
-                let c = waterfall_color(spectrum[idx]);
+                let idx = b * visible.len() / bins;
+                let c = waterfall_color(visible[idx]);
                 let x0 = rect.left() + b as f32 * bin_w;
                 painter.rect_filled(
                     egui::Rect::from_min_size(egui::pos2(x0, y0), egui::vec2(bin_w + 1.0, row_h + 1.0)),
