@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 mod android_uhd_context;
 mod futuresdr_backend;
+mod gsm;
 mod usb;
 mod uhd_wrapper;
 
@@ -52,6 +53,7 @@ struct SdrUiState {
     spectrum_db: Vec<f32>,
     waterfall: Vec<Vec<f32>>,
     constellation: Vec<Complex32>,
+    gsm900: gsm::Gsm900Analysis,
     frames: u64,
     last_update: Instant,
 }
@@ -80,6 +82,7 @@ impl Default for SdrUiState {
             spectrum_db: vec![-100.0; DEFAULT_FFT_SIZE],
             waterfall: Vec::new(),
             constellation: Vec::new(),
+            gsm900: gsm::Gsm900Analysis::default(),
             frames: 0,
             last_update: Instant::now(),
         }
@@ -382,6 +385,7 @@ enum UiTab {
 enum VisualView {
     Spectrum,
     Constellation,
+    Gsm900,
 }
 
 impl VisualView {
@@ -389,6 +393,7 @@ impl VisualView {
         match self {
             VisualView::Spectrum => "Spectrum",
             VisualView::Constellation => "Constellation",
+            VisualView::Gsm900 => "GSM-900",
         }
     }
 }
@@ -1022,7 +1027,7 @@ fn draw_fft_controls(ui: &mut egui::Ui, shared: &SharedState, state: &SdrUiState
 
 fn draw_visual_tabs(ui: &mut egui::Ui, active: &mut VisualView) {
     ui.horizontal(|ui| {
-        for view in [VisualView::Spectrum, VisualView::Constellation] {
+        for view in [VisualView::Spectrum, VisualView::Constellation, VisualView::Gsm900] {
             if ui.selectable_label(*active == view, view.label()).clicked() {
                 *active = view;
             }
@@ -1045,6 +1050,7 @@ fn draw_visualization(
             draw_waterfall(ui, state);
         }
         VisualView::Constellation => draw_constellation(ui, state),
+        VisualView::Gsm900 => draw_gsm900_analyzer(ui, state),
     }
 }
 
@@ -1223,6 +1229,252 @@ fn draw_grid(painter: &egui::Painter, rect: egui::Rect) {
             egui::Stroke::new(0.6_f32, grid),
         );
     }
+}
+
+fn draw_gsm900_analyzer(ui: &mut egui::Ui, state: &SdrUiState) {
+    let desired = egui::vec2(ui.available_width(), (ui.available_height() - 34.0).clamp(360.0, 760.0));
+    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(5, 7, 10));
+
+    let panel = rect.shrink(18.0);
+    let analysis = &state.gsm900;
+    let title_color = egui::Color32::from_rgb(220, 228, 238);
+    let muted = egui::Color32::from_rgb(145, 154, 168);
+    let good = egui::Color32::LIGHT_GREEN;
+    let warn = egui::Color32::YELLOW;
+    let bad = egui::Color32::from_rgb(255, 95, 95);
+
+    let (status, status_color) = if analysis.last_verified_sch.is_some() {
+        ("CELL LOCK", good)
+    } else if analysis
+        .sch_decode
+        .as_ref()
+        .map(|sch| sch.parity_ok)
+        .unwrap_or(false)
+    {
+        ("SCH OK", good)
+    } else if analysis.sch_decode.is_some() {
+        ("SCH CAND", warn)
+    } else if analysis.sch_detected {
+        ("SCH SYNC", good)
+    } else if analysis.fcch_detected {
+        ("FCCH LOCK", good)
+    } else if analysis.carrier_visible {
+        ("SEARCHING", warn)
+    } else if analysis.in_pgsm_downlink {
+        ("TUNE BW", warn)
+    } else {
+        ("OUT OF BAND", bad)
+    };
+
+    painter.text(
+        panel.left_top(),
+        egui::Align2::LEFT_TOP,
+        "GSM-900",
+        egui::FontId::proportional(28.0),
+        title_color,
+    );
+    painter.text(
+        panel.right_top(),
+        egui::Align2::RIGHT_TOP,
+        status,
+        egui::FontId::proportional(22.0),
+        status_color,
+    );
+
+    let card = |painter: &egui::Painter,
+                rect: egui::Rect,
+                title: &str,
+                value: String,
+                detail: String,
+                color: egui::Color32| {
+        painter.rect_filled(rect, 8.0, egui::Color32::from_rgb(14, 18, 24));
+        painter.rect_stroke(
+            rect,
+            8.0,
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(42, 50, 62)),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            rect.left_top() + egui::vec2(14.0, 12.0),
+            egui::Align2::LEFT_TOP,
+            title,
+            egui::FontId::proportional(14.0),
+            muted,
+        );
+        painter.text(
+            rect.left_top() + egui::vec2(14.0, 38.0),
+            egui::Align2::LEFT_TOP,
+            value,
+            egui::FontId::proportional(24.0),
+            color,
+        );
+        painter.text(
+            rect.left_top() + egui::vec2(14.0, 74.0),
+            egui::Align2::LEFT_TOP,
+            detail,
+            egui::FontId::proportional(14.0),
+            muted,
+        );
+    };
+
+    let top = panel.top() + 58.0;
+    let gap = 12.0;
+    let card_h = 112.0;
+    let card_w = (panel.width() - gap) / 2.0;
+    let left = panel.left();
+    let right = left + card_w + gap;
+
+    let arfcn_value = analysis
+        .arfcn
+        .map(|a| format!("ARFCN {a}"))
+        .unwrap_or_else(|| "No carrier".to_string());
+    let rf_detail = if analysis.carrier_visible {
+        format!("{:.1} MHz  {:+.0} kHz", analysis.carrier_hz / 1e6, analysis.carrier_offset_hz / 1e3)
+    } else {
+        format!("Tune 935.2–959.8 MHz; BW ≥ 200 kHz")
+    };
+    card(
+        &painter,
+        egui::Rect::from_min_size(egui::pos2(left, top), egui::vec2(card_w, card_h)),
+        "Carrier",
+        arfcn_value,
+        rf_detail,
+        if analysis.carrier_visible { good } else { warn },
+    );
+
+    let fcch_snr = analysis
+        .fcch_snr_db
+        .map(|snr| format!("{snr:.1} dB"))
+        .unwrap_or_else(|| "--".to_string());
+    let fcch_detail = if analysis.fcch_detected {
+        format!("tone {:+.1} kHz", analysis.fcch_freq_hz / 1e3)
+    } else if !analysis.fcch_visible {
+        "FCCH tone outside passband".to_string()
+    } else {
+        "waiting for frequency-correction burst".to_string()
+    };
+    card(
+        &painter,
+        egui::Rect::from_min_size(egui::pos2(right, top), egui::vec2(card_w, card_h)),
+        "FCCH SNR",
+        fcch_snr,
+        fcch_detail,
+        if analysis.fcch_detected { good } else { muted },
+    );
+
+    let row2 = top + card_h + gap;
+    let (sch_value, sch_detail, sch_color) = if let Some(sch) = analysis.last_verified_sch.as_ref().or(analysis.sch_decode.as_ref()) {
+        (
+            format!("BSIC {} ({}/{})", sch.bsic, sch.ncc, sch.bcc),
+            if sch.parity_ok {
+                format!("FN {}  verified x{}  metric {:.2}", sch.frame_number, analysis.verified_sch_count, sch.path_metric)
+            } else {
+                format!("cand T {}/{}/{}  syn 0x{:03x}  metric {:.2}", sch.t1, sch.t2, sch.t3p, sch.parity_syndrome, sch.path_metric)
+            },
+            if sch.parity_ok { good } else { warn },
+        )
+    } else if analysis.sch_detected {
+        (
+            "SYNC".to_string(),
+            analysis
+                .sch_correlation
+                .map(|corr| format!("training corr {corr:.2}/{:.2}; waiting for candidate decode", gsm::SCH_CORRELATION_THRESHOLD))
+                .unwrap_or_else(|| "training sequence detected".to_string()),
+            good,
+        )
+    } else if analysis.fcch_detected {
+        (
+            "SEARCH".to_string(),
+            analysis
+                .sch_correlation
+                .map(|corr| format!("SCH corr {corr:.2}/{:.2}; need sync burst", gsm::SCH_CORRELATION_THRESHOLD))
+                .unwrap_or_else(|| "waiting for SCH after FCCH lock".to_string()),
+            muted,
+        )
+    } else {
+        (
+            "--".to_string(),
+            "waiting for FCCH lock".to_string(),
+            muted,
+        )
+    };
+    card(
+        &painter,
+        egui::Rect::from_min_size(egui::pos2(left, row2), egui::vec2(card_w, card_h)),
+        "SCH",
+        sch_value,
+        sch_detail,
+        sch_color,
+    );
+
+    let (pipe_title, pipe_value, pipe_detail, pipe_color) = if analysis.last_verified_sch.is_some() {
+        if let Some(bcch) = &analysis.bcch_decode {
+            (
+                "BCCH",
+                if bcch.parity_ok { bcch.message_name.to_string() } else { "CAND".to_string() },
+                if bcch.parity_ok {
+                    format!("{}  {}", bcch.l2_hex, bcch.message_type.map(|t| format!("type 0x{t:02x}")).unwrap_or_default())
+                } else {
+                    format!("syn {:010x}  metric {:.2}", bcch.syndrome, bcch.path_metric)
+                },
+                if bcch.parity_ok { good } else { warn },
+            )
+        } else {
+            (
+                "BCCH",
+                if analysis.bcch_detected { "BURST" } else { "SEARCH" }.to_string(),
+                analysis
+                    .bcch_correlation
+                    .map(|corr| format!("normal burst corr {corr:.2}/{:.2}", gsm::BCCH_CORRELATION_THRESHOLD))
+                    .unwrap_or_else(|| "waiting for TS0 normal bursts".to_string()),
+                if analysis.bcch_detected { good } else { muted },
+            )
+        }
+    } else {
+        (
+            "Pipeline",
+            if analysis.sample_rate_ok { "Ready" } else { "Low SR" }.to_string(),
+            format!("{:.3} MS/s  BW {:.3} MHz", state.sample_rate / 1e6, state.bandwidth_hz / 1e6),
+            if analysis.sample_rate_ok { good } else { warn },
+        )
+    };
+    card(
+        &painter,
+        egui::Rect::from_min_size(egui::pos2(right, row2), egui::vec2(card_w, card_h)),
+        pipe_title,
+        pipe_value,
+        pipe_detail,
+        pipe_color,
+    );
+
+    let foot = panel.bottom() - 56.0;
+    let hint = if analysis.fcch_detected && analysis.sch_decode.is_none() {
+        "FCCH is locked. If SCH stays SEARCH, verify your test transmitter emits SCH on BCCH/C0 timeslot 0."
+    } else if analysis
+        .bcch_decode
+        .as_ref()
+        .map(|bcch| bcch.parity_ok)
+        .unwrap_or(false)
+    {
+        "BCCH block decoded. Next: parse System Information fields."
+    } else if analysis.bcch_decode.is_some() {
+        "BCCH candidate decoded but FIRE parity failed; improving timing/equalization is next."
+    } else if analysis.last_verified_sch.is_some() && analysis.bcch_detected {
+        "BCCH normal bursts detected. Collecting 4-burst control-channel blocks."
+    } else if analysis.last_verified_sch.is_some() {
+        "Cell lock verified. Waiting for BCCH/CCCH normal bursts on TS0."
+    } else {
+        "Next: verified BSIC/FN → BCCH metadata. Direct-cabled lab signals are supported."
+    };
+    painter.text(
+        egui::pos2(panel.left(), foot),
+        egui::Align2::LEFT_TOP,
+        hint,
+        egui::FontId::proportional(14.0),
+        muted,
+    );
 }
 
 fn visible_spectrum_bins(state: &SdrUiState) -> (usize, usize) {
