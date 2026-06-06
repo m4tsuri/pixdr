@@ -1,0 +1,144 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_name:
+        description: "GitHub Release name"
+        required: false
+        default: "pixdr manual APK"
+      tag_name:
+        description: "Release tag. Leave empty to use pixdr-apk-<run_number>"
+        required: false
+        default: ""
+      include_uhd_images:
+        description: "Download and package UHD B200/B210 firmware/FPGA images into the APK"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    name: Build and publish APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    env:
+      PIXDR_ANDROID_API: "29"
+      PIXDR_ANDROID_ABI: arm64-v8a
+      PIXDR_RUST_TARGET: aarch64-linux-android
+      PIXDR_NDK_VERSION: 27.3.13750724
+      PIXDR_JOBS: "2"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            autoconf \
+            automake \
+            libtool \
+            pkg-config \
+            cmake \
+            make \
+            wget \
+            tar \
+            zip \
+            unzip \
+            python3
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform, build-tools, and NDK
+        run: |
+          yes | sdkmanager \
+            "platforms;android-${PIXDR_ANDROID_API}" \
+            "build-tools;35.0.0" \
+            "ndk;${PIXDR_NDK_VERSION}"
+          echo "PIXDR_NDK=${ANDROID_HOME}/ndk/${PIXDR_NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${PIXDR_NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Cache Cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            app/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('app/Cargo.lock', 'app/Cargo.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Cache downloaded native sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/native/sources
+          key: native-sources-${{ runner.os }}-${{ hashFiles('scripts/build-native.sh') }}
+          restore-keys: |
+            native-sources-${{ runner.os }}-
+
+      - name: Build native dependencies
+        run: scripts/build-native.sh
+
+      - name: Optionally fetch UHD runtime images
+        if: ${{ inputs.include_uhd_images }}
+        run: scripts/fetch-uhd-images.sh
+
+      - name: Build and package APK
+        run: scripts/build-apk.sh
+
+      - name: Rename APK
+        run: |
+          mkdir -p dist
+          cp app/pixdr-debug.apk dist/pixdr-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}.apk
+          ls -lh dist/*.apk
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pixdr-apk
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG_NAME: ${{ inputs.tag_name }}
+          INPUT_RELEASE_NAME: ${{ inputs.release_name }}
+          INCLUDE_UHD_IMAGES: ${{ inputs.include_uhd_images }}
+        run: |
+          set -euo pipefail
+          TAG_NAME="${INPUT_TAG_NAME:-}"
+          if [[ -z "${TAG_NAME}" ]]; then
+            TAG_NAME="pixdr-apk-${GITHUB_RUN_NUMBER}"
+          fi
+          RELEASE_NAME="${INPUT_RELEASE_NAME:-pixdr manual APK}"
+          NOTES="Manual pixdr Android APK build from ${GITHUB_SHA}."
+          if [[ "${INCLUDE_UHD_IMAGES}" != "true" ]]; then
+            NOTES+=$'\n\nUHD firmware/FPGA images were not packaged. Rebuild with include_uhd_images=true if you intend to redistribute those files and have reviewed their license terms.'
+          fi
+          gh release create "${TAG_NAME}" dist/*.apk \
+            --target "${GITHUB_SHA}" \
+            --title "${RELEASE_NAME}" \
+            --notes "${NOTES}"
