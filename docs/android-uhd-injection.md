@@ -52,6 +52,8 @@ paths. libusb is now an upstream dependency, not an Android compatibility layer.
 
 `android_usbfs.cpp` implements UHD's `zero_copy_if` using reusable RX/TX URB
 slots. RX URBs are pre-submitted and re-submitted when the managed receive
-buffer is released. TX buffers are returned from a free queue and submitted as
-OUT URBs on managed send buffer release. A reaper thread drains completions with
+buffer is released. RX completions are reordered by URB submit sequence before
+being delivered to UHD, because usbfs may reap adjacent URBs out of order. TX
+buffers are returned from a free queue and submitted as OUT URBs on managed send
+buffer release. A reaper thread drains completions with
 `USBDEVFS_REAPURBNDELAY` and dispatches slots back to the appropriate queue.

@@ -1,4 +1,4 @@
-From d79040b33aaf5db02a70946f5a73c647e81f92f0 Mon Sep 17 00:00:00 2001
+From 6b572af86582b87d70e58ccb089fb14089aeb68e Mon Sep 17 00:00:00 2001
 From: M4tsuri <me@m4tsuri.com>
 Date: Sat, 6 Jun 2026 15:33:21 +0800
 Subject: [PATCH] pixdr: add Android context and native usbfs transport
@@ -8,7 +8,7 @@ Subject: [PATCH] pixdr: add Android context and native usbfs transport
  .../uhd/transport/usb_device_handle.hpp       |   4 +
  host/lib/transport/CMakeLists.txt             |   3 +
  host/lib/transport/android_usb_context.cpp    |  39 ++
- host/lib/transport/android_usbfs.cpp          | 597 ++++++++++++++++++
+ host/lib/transport/android_usbfs.cpp          | 620 ++++++++++++++++++
  host/lib/transport/android_usbfs.hpp          |  73 +++
  host/lib/transport/libusb1_control.cpp        |   5 +
  host/lib/transport/libusb1_zero_copy.cpp      |  10 +
@@ -16,7 +16,7 @@ Subject: [PATCH] pixdr: add Android context and native usbfs transport
  host/lib/usrp/b200/b200_impl.cpp              |  76 ++-
  host/lib/utils/pathslib.cpp                   |   4 +-
  host/lib/utils/platform.cpp                   |   3 +
- 12 files changed, 857 insertions(+), 27 deletions(-)
+ 12 files changed, 880 insertions(+), 27 deletions(-)
  create mode 100644 host/include/uhd/transport/android_usb_context.hpp
  create mode 100644 host/lib/transport/android_usb_context.cpp
  create mode 100644 host/lib/transport/android_usbfs.cpp
@@ -139,10 +139,10 @@ index 0000000..dc9695f
 +}} // namespace uhd::transport
 diff --git a/host/lib/transport/android_usbfs.cpp b/host/lib/transport/android_usbfs.cpp
 new file mode 100644
-index 0000000..216a564
+index 0000000..7d7c4de
 --- /dev/null
 +++ b/host/lib/transport/android_usbfs.cpp
-@@ -0,0 +1,597 @@
+@@ -0,0 +1,620 @@
 +//
 +// Copyright 2026 pixdr contributors
 +//
@@ -164,6 +164,7 @@ index 0000000..216a564
 +#include <cstring>
 +#include <deque>
 +#include <linux/usbdevice_fs.h>
++#include <map>
 +#include <mutex>
 +#include <sys/ioctl.h>
 +#include <thread>
@@ -375,6 +376,7 @@ index 0000000..216a564
 +    android_usbfs_zero_copy_impl* owner = nullptr;
 +    bool is_recv                       = false;
 +    size_t index                       = 0;
++    uint64_t sequence                  = 0;
 +    std::atomic<bool> in_flight{false};
 +};
 +
@@ -503,20 +505,25 @@ index 0000000..216a564
 +    managed_recv_buffer::sptr get_recv_buff(double timeout) override
 +    {
 +        std::unique_lock<std::mutex> lock(_recv_mutex);
-+        if (_recv_ready.empty()) {
++        auto has_next = [this]() {
++            return _recv_completed.count(_next_recv_deliver_seq) > 0 || _stopping.load();
++        };
++        if (!has_next()) {
 +            if (timeout < 0.0) {
-+                _recv_cv.wait(lock, [this]() { return !_recv_ready.empty() || _stopping.load(); });
++                _recv_cv.wait(lock, has_next);
 +            } else {
 +                _recv_cv.wait_for(lock,
 +                    std::chrono::microseconds(static_cast<int64_t>(timeout * 1e6)),
-+                    [this]() { return !_recv_ready.empty() || _stopping.load(); });
++                    has_next);
 +            }
 +        }
-+        if (_recv_ready.empty()) {
++        auto it = _recv_completed.find(_next_recv_deliver_seq);
++        if (it == _recv_completed.end()) {
 +            return managed_recv_buffer::sptr();
 +        }
-+        const size_t index = _recv_ready.front();
-+        _recv_ready.pop_front();
++        const size_t index = it->second;
++        _recv_completed.erase(it);
++        _next_recv_deliver_seq++;
 +        const int actual_length = _recv_slots[index]->urb->actual_length;
 +        return _recv_mbs[index]->make_with_length(size_t(actual_length > 0 ? actual_length : 0));
 +    }
@@ -591,7 +598,7 @@ index 0000000..216a564
 +    std::vector<std::shared_ptr<android_usbfs_urb_slot>> _send_slots;
 +    std::vector<std::shared_ptr<android_usbfs_recv_mb>> _recv_mbs;
 +    std::vector<std::shared_ptr<android_usbfs_send_mb>> _send_mbs;
-+    std::deque<size_t> _recv_ready;
++    std::map<uint64_t, size_t> _recv_completed;
 +    std::deque<size_t> _send_free;
 +    std::mutex _recv_mutex;
 +    std::mutex _send_mutex;
@@ -599,6 +606,8 @@ index 0000000..216a564
 +    std::condition_variable _send_cv;
 +    std::thread _reaper_thread;
 +    std::atomic<bool> _stopping{false};
++    uint64_t _next_recv_submit_seq = 0;
++    uint64_t _next_recv_deliver_seq = 0;
 +
 +    void init_urb(android_usbfs_urb_slot& slot, unsigned char endpoint, void* buffer, size_t length)
 +    {
@@ -614,7 +623,13 @@ index 0000000..216a564
 +    {
 +        android_usbfs_urb_slot& slot = *_recv_slots[index];
 +        init_urb(slot, _recv_endpoint, _recv_pool->at(index), _recv_frame_size);
-+        submit_slot(slot, "IN");
++        {
++            std::lock_guard<std::mutex> lock(_recv_mutex);
++            slot.sequence = _next_recv_submit_seq++;
++        }
++        if (!submit_slot(slot, "IN")) {
++            mark_recv_completed(slot);
++        }
 +    }
 +
 +    void submit_send(size_t index, size_t nbytes)
@@ -658,7 +673,9 @@ index 0000000..216a564
 +                continue;
 +            }
 +            auto* slot = static_cast<android_usbfs_urb_slot*>(completed->usercontext);
-+            complete_slot(*slot);
++            if (slot && slot->owner) {
++                slot->owner->complete_slot(*slot);
++            }
 +        }
 +    }
 +
@@ -671,16 +688,13 @@ index 0000000..216a564
 +
 +        if (slot.is_recv) {
 +            if (slot.urb->status == 0 && slot.urb->actual_length > 0) {
-+                {
-+                    std::lock_guard<std::mutex> lock(_recv_mutex);
-+                    _recv_ready.push_back(slot.index);
-+                }
-+                _recv_cv.notify_one();
++                mark_recv_completed(slot);
 +            } else {
 +                if (slot.urb->status != -ENOENT && slot.urb->status != -ECONNRESET) {
 +                    UHD_LOGGER_TRACE("USB") << "Android usbfs IN URB status=" << slot.urb->status;
 +                }
-+                submit_recv(slot.index);
++                slot.urb->actual_length = 0;
++                mark_recv_completed(slot);
 +            }
 +        } else {
 +            if (slot.urb->status != 0 && slot.urb->status != -ENOENT && slot.urb->status != -ECONNRESET) {
@@ -688,6 +702,15 @@ index 0000000..216a564
 +            }
 +            mark_send_free(slot.index);
 +        }
++    }
++
++    void mark_recv_completed(android_usbfs_urb_slot& slot)
++    {
++        {
++            std::lock_guard<std::mutex> lock(_recv_mutex);
++            _recv_completed[slot.sequence] = slot.index;
++        }
++        _recv_cv.notify_one();
 +    }
 +
 +    void mark_send_free(size_t index)
