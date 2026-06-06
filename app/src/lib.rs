@@ -18,6 +18,7 @@ mod uhd_wrapper;
 
 const DEFAULT_FFT_SIZE: usize = 8192;
 const WATERFALL_ROWS: usize = 96;
+const MAX_CONSTELLATION_POINTS: usize = 2048;
 const SAFE_TOP_PAD: i8 = 72;
 const SAFE_SIDE_PAD: i8 = 18;
 const SAFE_BOTTOM_PAD: i8 = 18;
@@ -48,6 +49,7 @@ struct SdrUiState {
     applied_fft_revision: u64,
     spectrum_db: Vec<f32>,
     waterfall: Vec<Vec<f32>>,
+    constellation: Vec<Complex32>,
     frames: u64,
     last_update: Instant,
 }
@@ -73,6 +75,7 @@ impl Default for SdrUiState {
             applied_fft_revision: 0,
             spectrum_db: vec![-100.0; DEFAULT_FFT_SIZE],
             waterfall: Vec::new(),
+            constellation: Vec::new(),
             frames: 0,
             last_update: Instant::now(),
         }
@@ -279,10 +282,11 @@ fn fft_to_db(fft: &[Complex32]) -> Vec<f32> {
         .collect()
 }
 
-fn update_spectrum(shared: &SharedState, spectrum: Vec<f32>) {
+fn update_signal_products(shared: &SharedState, spectrum: Vec<f32>, constellation: Vec<Complex32>) {
     update_state(shared, |s| {
         s.spectrum_db = spectrum.clone();
         s.waterfall.push(spectrum);
+        s.constellation = constellation;
         if s.waterfall.len() > WATERFALL_ROWS {
             let extra = s.waterfall.len() - WATERFALL_ROWS;
             s.waterfall.drain(0..extra);
@@ -332,9 +336,25 @@ enum UiTab {
     Fft,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VisualView {
+    Spectrum,
+    Constellation,
+}
+
+impl VisualView {
+    fn label(self) -> &'static str {
+        match self {
+            VisualView::Spectrum => "Spectrum",
+            VisualView::Constellation => "Constellation",
+        }
+    }
+}
+
 struct PixdrApp {
     shared: SharedState,
     active_tab: UiTab,
+    active_visual: VisualView,
     freq_edit_digit: Option<usize>,
     freq_edit_text: String,
     spectrum_pinch_active: bool,
@@ -346,6 +366,7 @@ impl PixdrApp {
         Self {
             shared,
             active_tab: UiTab::Radio,
+            active_visual: VisualView::Spectrum,
             freq_edit_digit: None,
             freq_edit_text: String::new(),
             spectrum_pinch_active: false,
@@ -392,15 +413,16 @@ impl eframe::App for PixdrApp {
                     UiTab::Fft => draw_fft_controls(ui, &self.shared, &state),
                 }
                 ui.add_space(6.0);
-                draw_spectrum(
+                draw_visual_tabs(ui, &mut self.active_visual);
+                ui.add_space(4.0);
+                draw_visualization(
                     ui,
                     &self.shared,
                     &state,
+                    self.active_visual,
                     &mut self.spectrum_pinch_active,
                     &mut self.spectrum_last_commit,
                 );
-                ui.add_space(6.0);
-                draw_waterfall(ui, &state);
                 ui.add_space(4.0);
                 draw_status(ui, &state);
             });
@@ -632,9 +654,9 @@ fn frequency_digit_cell(
         egui::Color32::from_rgb(22, 27, 36)
     };
     let stroke = if active || hovered {
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(92, 185, 230))
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(92, 185, 230))
     } else {
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 52, 64))
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(45, 52, 64))
     };
     ui.painter().rect(rect, 4.0, fill, stroke, egui::StrokeKind::Inside);
     ui.painter().text(
@@ -901,6 +923,34 @@ fn draw_fft_controls(ui: &mut egui::Ui, shared: &SharedState, state: &SdrUiState
         });
 }
 
+fn draw_visual_tabs(ui: &mut egui::Ui, active: &mut VisualView) {
+    ui.horizontal(|ui| {
+        for view in [VisualView::Spectrum, VisualView::Constellation] {
+            if ui.selectable_label(*active == view, view.label()).clicked() {
+                *active = view;
+            }
+        }
+    });
+}
+
+fn draw_visualization(
+    ui: &mut egui::Ui,
+    shared: &SharedState,
+    state: &SdrUiState,
+    active: VisualView,
+    spectrum_pinch_active: &mut bool,
+    spectrum_last_commit: &mut Option<Instant>,
+) {
+    match active {
+        VisualView::Spectrum => {
+            draw_spectrum(ui, shared, state, spectrum_pinch_active, spectrum_last_commit);
+            ui.add_space(6.0);
+            draw_waterfall(ui, state);
+        }
+        VisualView::Constellation => draw_constellation(ui, state),
+    }
+}
+
 fn draw_spectrum(
     ui: &mut egui::Ui,
     shared: &SharedState,
@@ -941,7 +991,7 @@ fn draw_spectrum(
 
         painter.add(egui::Shape::line(
             points,
-            egui::Stroke::new(1.6, egui::Color32::from_rgb(90, 220, 120)),
+            egui::Stroke::new(1.6_f32, egui::Color32::from_rgb(90, 220, 120)),
         ));
     } else {
         painter.text(
@@ -1075,6 +1125,82 @@ fn draw_grid(painter: &egui::Painter, rect: egui::Rect) {
             egui::Stroke::new(0.6_f32, grid),
         );
     }
+}
+
+fn draw_constellation(ui: &mut egui::Ui, state: &SdrUiState) {
+    let desired = egui::vec2(ui.available_width(), (ui.available_height() - 34.0).clamp(360.0, 760.0));
+    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(5, 7, 10));
+
+    let plot_side = rect.width().min(rect.height()) * 0.92;
+    let plot_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(plot_side, plot_side));
+    painter.rect_stroke(
+        plot_rect,
+        4.0,
+        egui::Stroke::new(0.8_f32, egui::Color32::from_gray(50)),
+        egui::StrokeKind::Inside,
+    );
+
+    let grid = egui::Color32::from_gray(36);
+    for i in 1..4 {
+        let t = i as f32 / 4.0;
+        let x = egui::lerp(plot_rect.left()..=plot_rect.right(), t);
+        let y = egui::lerp(plot_rect.top()..=plot_rect.bottom(), t);
+        painter.line_segment(
+            [egui::pos2(x, plot_rect.top()), egui::pos2(x, plot_rect.bottom())],
+            egui::Stroke::new(0.5_f32, grid),
+        );
+        painter.line_segment(
+            [egui::pos2(plot_rect.left(), y), egui::pos2(plot_rect.right(), y)],
+            egui::Stroke::new(0.5_f32, grid),
+        );
+    }
+    painter.line_segment(
+        [egui::pos2(plot_rect.center().x, plot_rect.top()), egui::pos2(plot_rect.center().x, plot_rect.bottom())],
+        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(78)),
+    );
+    painter.line_segment(
+        [egui::pos2(plot_rect.left(), plot_rect.center().y), egui::pos2(plot_rect.right(), plot_rect.center().y)],
+        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(78)),
+    );
+
+    if state.constellation.is_empty() {
+        painter.text(
+            plot_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "No IQ samples for constellation",
+            egui::FontId::proportional(17.0),
+            egui::Color32::GRAY,
+        );
+        return;
+    }
+
+    let mut scale = state
+        .constellation
+        .iter()
+        .map(|c| c.re.abs().max(c.im.abs()))
+        .fold(0.0_f32, f32::max);
+    scale = (scale * 1.15).clamp(0.05, 2.0);
+    let half = plot_rect.width() * 0.5;
+    let color = if state.streaming {
+        egui::Color32::from_rgba_premultiplied(90, 220, 150, 150)
+    } else {
+        egui::Color32::from_rgba_premultiplied(78, 135, 96, 130)
+    };
+    for sample in &state.constellation {
+        let x = plot_rect.center().x + (sample.re / scale).clamp(-1.0, 1.0) * half;
+        let y = plot_rect.center().y - (sample.im / scale).clamp(-1.0, 1.0) * half;
+        painter.circle_filled(egui::pos2(x, y), 1.4, color);
+    }
+
+    painter.text(
+        plot_rect.left_top() + egui::vec2(8.0, 8.0),
+        egui::Align2::LEFT_TOP,
+        format!("{} IQ points", state.constellation.len()),
+        egui::FontId::proportional(13.0),
+        egui::Color32::GRAY,
+    );
 }
 
 fn draw_waterfall(ui: &mut egui::Ui, state: &SdrUiState) {

@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::{
-    apply_hann, apply_rx_config, current_fft_config, fft_to_db, smooth_spectrum, update_spectrum,
-    update_state, SharedState,
+    apply_hann, apply_rx_config, current_fft_config, fft_to_db, smooth_spectrum,
+    update_signal_products, update_state, SharedState, MAX_CONSTELLATION_POINTS,
 };
 
 /// Run the pixdr receive pipeline as a FutureSDR flowgraph.
@@ -246,9 +246,14 @@ where
             self.fft_buf[..n].copy_from_slice(&input[..n]);
             apply_hann(&mut self.fft_buf[..n]);
             self.fft.process(&mut self.fft_buf);
+            let constellation = decimate_constellation(input, MAX_CONSTELLATION_POINTS);
             let spectrum = fft_to_db(&self.fft_buf);
             smooth_spectrum(&spectrum, &mut self.smoothed_spectrum, self.smoothing);
-            update_spectrum(&self.shared, self.smoothed_spectrum.clone());
+            update_signal_products(
+                &self.shared,
+                self.smoothed_spectrum.clone(),
+                constellation,
+            );
             self.last_publish = Instant::now();
         }
 
@@ -258,4 +263,12 @@ where
         }
         Ok(())
     }
+}
+
+fn decimate_constellation(input: &[Complex32], max_points: usize) -> Vec<Complex32> {
+    if input.is_empty() || max_points == 0 {
+        return Vec::new();
+    }
+    let step = (input.len() / max_points).max(1);
+    input.iter().step_by(step).take(max_points).copied().collect()
 }
