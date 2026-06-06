@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.pixdr.app">
+
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="35" />
+    <uses-feature android:name="android.hardware.usb.host" android:required="true" />
+
+    <application
+        android:hasCode="false"
+        android:label="Pixdr"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <activity
+            android:name="android.app.NativeActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|keyboardHidden|screenSize">
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="pixdr" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- USB permission is requested explicitly from NativeActivity via UsbManager.requestPermission().
+                 Do not register USB_DEVICE_ATTACHED here: NativeActivity does not handle onNewIntent,
+                 and Android may launch a second NativeActivity during the short FX3 firmware window. -->
+        </activity>
+    </application>
+</manifest>

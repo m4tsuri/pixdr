@@ -1,0 +1,24 @@
+# Build outputs
+/build/
+/target/
+/app/target/
+/app/*.apk
+/app/*.apk.idsig
+/app/*-unaligned.apk
+
+# Generated firmware/FPGA images; fetch with scripts/fetch-uhd-images.sh
+/app/assets/*
+!/app/assets/README.md
+
+# Legacy/generated native workspace, should not be used by scripts
+/build-uhd/
+
+# Logs / temporary files
+*.log
+*.tmp
+.DS_Store
+
+# IDEs
+.idea/
+.vscode/
+*.iml

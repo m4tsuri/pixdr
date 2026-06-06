@@ -1,0 +1,162 @@
+From f57f2a92fc54e7f08bca1ad155f26f0ae1df6373 Mon Sep 17 00:00:00 2001
+From: M4tsuri <me@m4tsuri.com>
+Date: Sat, 6 Jun 2026 14:19:39 +0800
+Subject: [PATCH] pixdr: support Android UHD cross build
+
+---
+ uhd-sys/build.rs | 117 +++++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 98 insertions(+), 19 deletions(-)
+
+diff --git a/uhd-sys/build.rs b/uhd-sys/build.rs
+index 68255ec..0d7d85b 100644
+--- a/uhd-sys/build.rs
++++ b/uhd-sys/build.rs
+@@ -1,25 +1,103 @@
+-extern crate bindgen;
+-extern crate metadeps;
+-
+ use std::env;
+ use std::path::{Path, PathBuf};
+ 
+ fn main() {
+-    // This reads the metadata in Cargo.toml and sends Cargo the appropriate output to link the
+-    // libraries
+-    let libraries = metadeps::probe().unwrap();
++    let target = env::var("TARGET").expect("No TARGET environment variable");
++
++    // On Android, use environment variables to locate UHD.
++    // On desktop, use pkg-config via metadeps.
++    if target.contains("android") {
++        build_android();
++    } else {
++        build_desktop();
++    }
++}
++
++/// Android cross-compilation: expect UHD_INCLUDE_DIR and UHD_LIB_DIR env vars.
++fn build_android() {
++    let uhd_include = env::var("UHD_INCLUDE_DIR")
++        .expect("UHD_INCLUDE_DIR must be set for Android builds (path to uhd.h)");
++    let uhd_lib = env::var("UHD_LIB_DIR")
++        .expect("UHD_LIB_DIR must be set for Android builds (path to libuhd.so)");
++
++    println!("cargo:rustc-link-search=native={}", uhd_lib);
++    println!("cargo:rustc-link-lib=uhd");
++
++    // Also link Boost static libs (required by libuhd.so on Android)
++    if let Ok(boost_lib) = env::var("BOOST_LIB_DIR") {
++        println!("cargo:rustc-link-search=native={}", boost_lib);
++    }
++
++    // For bindgen to parse uhd.h we need:
++    // 1. The UHD include dir itself
++    // 2. The NDK sysroot for standard C/C++ headers
++    // 3. Boost include dir (UHD headers pull in boost)
++    let include_path = Path::new(&uhd_include);
++
++    let mut clang_args: Vec<String> = vec![
++        format!("-I{}", include_path.display()),
++    ];
++
++    // NDK sysroot
++    if let Ok(ndk_sysroot) = env::var("NDK_SYSROOT") {
++        clang_args.push(format!("-I{}/usr/include", ndk_sysroot));
++        clang_args.push(format!("-I{}/usr/include/aarch64-linux-android", ndk_sysroot));
++    }
++
++    // Boost includes
++    if let Ok(boost_include) = env::var("BOOST_INCLUDE_DIR") {
++        clang_args.push(format!("-I{}", boost_include));
++    } else {
++        // Default: boost is alongside uhd in the toolchain
++        let default_boost = include_path.join("boost");
++        if default_boost.exists() {
++            clang_args.push(format!("-I{}", include_path.display()));
++        }
++    }
++
++    // Define Android-specific macros that uhd.h may expect
++    clang_args.push("-DANDROID".into());
++    clang_args.push("-D__ANDROID__".into());
++
++    generate_bindings(include_path, &clang_args);
++
++    // Re-run if these env vars change
++    println!("cargo:rerun-if-env-changed=UHD_INCLUDE_DIR");
++    println!("cargo:rerun-if-env-changed=UHD_LIB_DIR");
++    println!("cargo:rerun-if-env-changed=BOOST_LIB_DIR");
++    println!("cargo:rerun-if-env-changed=BOOST_INCLUDE_DIR");
++    println!("cargo:rerun-if-env-changed=NDK_SYSROOT");
++}
++
++/// Desktop build: use pkg-config via metadeps (original behaviour).
++fn build_desktop() {
++    let libraries = metadeps::probe()
++        .expect("Failed to find UHD via pkg-config. Install UHD or set UHD_INCLUDE_DIR/UHD_LIB_DIR.");
+ 
+     let uhd_include_path = libraries
+         .get("uhd")
+-        .expect("uhd library not in map")
++        .expect("uhd library not in pkg-config map")
+         .include_paths
+         .first()
+         .expect("no include path for UHD headers");
+-    generate_bindings(uhd_include_path);
++
++    generate_bindings(uhd_include_path, &[]);
++
++    // macOS Apple Silicon boost libs
++    let target = env::var("TARGET").unwrap_or_default();
++    if target == "aarch64-apple-darwin" {
++        println!("cargo:rustc-link-search=/opt/homebrew/lib/");
++    }
+ }
+ 
+-fn generate_bindings(include_path: &Path) {
++fn generate_bindings(include_path: &Path, extra_clang_args: &[String]) {
+     let usrp_header = include_path.join("uhd.h");
++    if !usrp_header.exists() {
++        panic!(
++            "uhd.h not found at {}. Set UHD_INCLUDE_DIR to the directory containing uhd.h.",
++            usrp_header.display()
++        );
++    }
+ 
+     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+     let out_path = out_dir.join("bindgen.rs");
+@@ -27,21 +105,22 @@ fn generate_bindings(include_path: &Path) {
+     let mut builder = bindgen::builder()
+         .whitelist_function("^uhd.+")
+         .default_enum_style(bindgen::EnumVariation::ModuleConsts)
+-        .header(usrp_header.to_string_lossy().clone())
+-        // Add the include directory to ensure that #includes in the header work correctly
+-        .clang_arg(format!("-I{}", include_path.to_string_lossy().clone()));
++        .header(usrp_header.to_string_lossy())
++        .clang_arg(format!("-I{}", include_path.display()));
+ 
+-    // On Raspberry Pi devices, the include directories require some adjustment.
+-    let target = env::var("TARGET").expect("No TARGET environment variable");
++    // Platform-specific include adjustments
++    let target = env::var("TARGET").unwrap_or_default();
+     if target == "armv7-unknown-linux-gnueabihf" {
+         builder = builder.clang_arg("-I/usr/lib/gcc/arm-linux-gnueabihf/8/include");
+-    } else if target == "aarch64-apple-darwin" {
+-        // On macOS Apple Silicon, boost libs from `brew install boost` are at this path
+-        println!("cargo:rustc-link-search=/opt/homebrew/lib/");
+     }
+ 
+-    let bindings = builder.generate().expect("Failed to generate bindings");
++    // Add extra clang args (Android sysroot, boost, etc.)
++    for arg in extra_clang_args {
++        builder = builder.clang_arg(arg);
++    }
++
++    let bindings = builder.generate().expect("Failed to generate UHD FFI bindings via bindgen");
+     bindings
+         .write_to_file(out_path)
+-        .expect("Failed to write bindings to file");
++        .expect("Failed to write bindgen output");
+ }
+-- 
+2.54.0
+

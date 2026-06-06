@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- B210 in application mode (after firmware loaded) -->
+    <usb-device vendor-id="9472" product-id="32" />
+    <!-- Cypress FX3 bootloader (before firmware loaded) -->
+    <usb-device vendor-id="1204" product-id="243" />
+</resources>

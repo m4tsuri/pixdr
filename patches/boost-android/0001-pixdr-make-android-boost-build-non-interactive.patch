@@ -1,0 +1,44 @@
+From 4657e92ca27fa9921796d58859916047473c4521 Mon Sep 17 00:00:00 2001
+From: M4tsuri <me@m4tsuri.com>
+Date: Sat, 6 Jun 2026 14:19:42 +0800
+Subject: [PATCH] pixdr: make Android Boost build non-interactive
+
+---
+ __build.sh | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/__build.sh b/__build.sh
+index d236abe..53d5c88 100755
+--- a/__build.sh
++++ b/__build.sh
+@@ -25,7 +25,8 @@ LIBS_DIR=${PREFIX_DIR}/libs
+ INCLUDE_DIR=${PREFIX_DIR}/include
+ 
+ WITHOUT_LIBRARIES="--without-python"
+-WITHOUT_LIBRARIES+=" --without-process"     # avoid:  "libs/process/src/shell.cpp:23:10: fatal error: 'wordexp.h' file not found" 
++WITHOUT_LIBRARIES+=" --without-process"
++WITHOUT_LIBRARIES+=" --without-wave"     # avoid:  "libs/process/src/shell.cpp:23:10: fatal error: 'wordexp.h' file not found" 
+                                             # 'process' control very restriced in  android sandboxes anyways
+ 
+ # only build these libs
+@@ -384,7 +385,7 @@ do_build()
+             # toolset=clang-$toolset_name     \
+                                     
+             {
+-                ./b2 -q -j$num_cores    \
++                ./b2 -j$num_cores    \
+                     binary-format=elf \
+                     address-model=$address_model \
+                     architecture=$arch_for_abi \
+@@ -411,7 +412,7 @@ do_build()
+ }
+ #------------------------------------------- 
+ 
+-# do_build 
++do_build 
+ 
+ persist_ndk_version
+ 
+-- 
+2.54.0
+

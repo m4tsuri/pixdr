@@ -1,0 +1,96 @@
+From d8bcf884163704db6611076bd2dd06878e92671d Mon Sep 17 00:00:00 2001
+From: M4tsuri <me@m4tsuri.com>
+Date: Sat, 6 Jun 2026 14:19:35 +0800
+Subject: [PATCH] pixdr: support Android wrapped usbfs fd diagnostics
+
+---
+ libusb/core.c           | 24 ++++++++++++++++++++++++
+ libusb/os/linux_usbfs.c | 20 ++++++++++++++++++--
+ 2 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/libusb/core.c b/libusb/core.c
+index ffe33b7..fabe975 100644
+--- a/libusb/core.c
++++ b/libusb/core.c
+@@ -1378,6 +1378,30 @@ int API_EXPORTED libusb_wrap_sys_device(libusb_context *ctx, intptr_t sys_dev,
+ 	usbi_mutex_lock(&ctx->open_devs_lock);
+ 	list_add(&_dev_handle->list, &ctx->open_devs);
+ 	usbi_mutex_unlock(&ctx->open_devs_lock);
++
++	/* Android: wrap_sys_device doesn't set dev_handle->dev.
++	   Create a minimal dummy device so that libusb_submit_transfer
++	   doesn't dereference NULL in HANDLE_CTX() macro. */
++	{
++		struct libusb_device *dev = calloc(1, sizeof(*dev));
++		if (!dev) {
++			usbi_mutex_lock(&ctx->open_devs_lock);
++			list_del(&_dev_handle->list);
++			usbi_mutex_unlock(&ctx->open_devs_lock);
++			usbi_mutex_destroy(&_dev_handle->lock);
++			free(_dev_handle);
++			return LIBUSB_ERROR_NO_MEM;
++		}
++		dev->ctx = ctx;
++		dev->bus_number = 1;
++		dev->device_address = 2;
++		dev->speed = LIBUSB_SPEED_SUPER;
++		usbi_atomic_store(&dev->refcnt, 1);
++		usbi_atomic_store(&dev->attached, 1);
++		list_add(&dev->list, &ctx->usb_devs);
++		_dev_handle->dev = dev;
++	}
++
+ 	*dev_handle = _dev_handle;
+ 
+ 	return 0;
+diff --git a/libusb/os/linux_usbfs.c b/libusb/os/linux_usbfs.c
+index ed8597b..52d078a 100644
+--- a/libusb/os/linux_usbfs.c
++++ b/libusb/os/linux_usbfs.c
+@@ -37,6 +37,9 @@
+ #include <sys/utsname.h>
+ #include <sys/vfs.h>
+ #include <unistd.h>
++#ifdef __ANDROID__
++#include <android/log.h>
++#endif
+ 
+ /* sysfs vs usbfs:
+  * opening a usbfs node causes the device to be resumed, so we attempt to
+@@ -1362,6 +1365,9 @@ static int op_wrap_sys_device(struct libusb_context *ctx,
+ 		r = ioctl(fd, IOCTL_USBFS_CONNECTINFO, &ci);
+ 		if (r < 0) {
+ 			usbi_err(ctx, "connectinfo failed, errno=%d", errno);
++#ifdef __ANDROID__
++			__android_log_print(ANDROID_LOG_WARN, "pixdr-libusb", "wrap fd %d connectinfo failed errno=%d", fd, errno);
++#endif
+ 			return LIBUSB_ERROR_IO;
+ 		}
+ 		/* There is no ioctl to get the bus number. We choose 0 here
+@@ -1378,11 +1384,21 @@ static int op_wrap_sys_device(struct libusb_context *ctx,
+ 		return LIBUSB_ERROR_NO_MEM;
+ 
+ 	r = initialize_device(dev, busnum, devaddr, NULL, fd);
+-	if (r < 0)
++	if (r < 0) {
++#ifdef __ANDROID__
++		static int init_fail_logs = 0;
++		if (init_fail_logs++ < 5)
++			__android_log_print(ANDROID_LOG_WARN, "pixdr-libusb", "wrap fd %d initialize_device failed r=%d", fd, r);
++#endif
+ 		goto out;
++	}
+ 	r = usbi_sanitize_device(dev);
+-	if (r < 0)
++	if (r < 0) {
++#ifdef __ANDROID__
++		__android_log_print(ANDROID_LOG_WARN, "pixdr-libusb", "wrap fd %d sanitize_device failed r=%d", fd, r);
++#endif
+ 		goto out;
++	}
+ 	/* Consider the device as connected, but do not add it to the managed
+ 	 * device list. */
+ 	usbi_atomic_store(&dev->attached, 1);
+-- 
+2.54.0
+
